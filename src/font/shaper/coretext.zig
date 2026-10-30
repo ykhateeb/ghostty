@@ -2026,14 +2026,14 @@ test "shape Bengali sentence keeps base clusters anchored" {
     ) catch return error.SkipZigTest;
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 200, .rows = 3 });
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 200, .rows = 3 });
     defer t.deinit(alloc);
 
     t.modes.set(.grapheme_cluster, true);
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("পছন্দের ভাষা টাইপ করা আরো সহজ করে তোলে৷ আরো জানুন");
+    s.nextSlice("পছন্দের ভাষা টাইপ করা আরো সহজ করে তোলে৷ আরো জানুন");
 
     var state: terminal.RenderState = .empty;
     defer state.deinit(alloc);
@@ -2085,14 +2085,14 @@ test "shape Bengali sentence in mixed-direction line keeps base clusters anchore
     ) catch return error.SkipZigTest;
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 220, .rows = 3 });
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 220, .rows = 3 });
     defer t.deinit(alloc);
 
     t.modes.set(.grapheme_cluster, true);
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("ABC পছন্দের ভাষা টাইপ করা আরো সহজ করে তোলে৷ আরো জানুন مرحبا");
+    s.nextSlice("ABC পছন্দের ভাষা টাইপ করা আরো সহজ করে তোলে৷ আরো জানুন مرحبا");
 
     var state: terminal.RenderState = .empty;
     defer state.deinit(alloc);
@@ -2748,12 +2748,12 @@ test "shape LTR neutral RTL splits and sets direction" {
     defer testdata.deinit();
 
     // "Hello مرحبا" — LTR "Hello" then neutral space then RTL Arabic.
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("Hello مرحبا");
+    s.nextSlice("Hello مرحبا");
 
     var state: terminal.RenderState = .empty;
     defer state.deinit(alloc);
@@ -2786,12 +2786,12 @@ test "shape hebrew RTL" {
     var testdata = try testShaperWithFont(alloc, .julia_mono);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("שלום עולם");
+    s.nextSlice("שלום עולם");
 
     var state: terminal.RenderState = .empty;
     defer state.deinit(alloc);
@@ -2830,12 +2830,12 @@ test "shape arabic with tashkeel at EOL" {
     var testdata = try testShaperWithFont(alloc, .arabic);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("مرحباً");
+    s.nextSlice("مرحباً");
 
     var state: terminal.RenderState = .empty;
     defer state.deinit(alloc);
@@ -2872,12 +2872,12 @@ test "shape arabic with tashkeel on middle letters" {
     var testdata = try testShaperWithFont(alloc, .arabic);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("وفُكَّ");
+    s.nextSlice("وفُكَّ");
 
     var state: terminal.RenderState = .empty;
     defer state.deinit(alloc);
@@ -2915,12 +2915,12 @@ test "shape arabic tanween stays on hamza before space" {
     var testdata = try testShaperWithFont(alloc, .arabic);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("شيءٍ جميل");
+    s.nextSlice("شيءٍ جميل");
 
     var state: terminal.RenderState = .empty;
     defer state.deinit(alloc);
@@ -2965,12 +2965,12 @@ test "shape arabic end tashkeel no overlap" {
     var testdata = try testShaperWithFont(alloc, .arabic);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("بحقِّ");
+    s.nextSlice("بحقِّ");
 
     var state: terminal.RenderState = .empty;
     defer state.deinit(alloc);
@@ -3042,12 +3042,12 @@ test "shape arabic end tanween no overlap" {
     var testdata = try testShaperWithFont(alloc, .arabic);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("عينٍ");
+    s.nextSlice("عينٍ");
 
     var state: terminal.RenderState = .empty;
     defer state.deinit(alloc);
@@ -3115,12 +3115,12 @@ test "shape arabic multiword end tashkeel stays anchored" {
     var testdata = try testShaperWithFont(alloc, .arabic);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
     defer s.deinit();
-    try s.nextSlice("الحيِّ الذي");
+    s.nextSlice("الحيِّ الذي");
 
     var state: terminal.RenderState = .empty;
     defer state.deinit(alloc);

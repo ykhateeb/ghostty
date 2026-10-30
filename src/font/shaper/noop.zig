@@ -96,6 +96,7 @@ pub const Shaper = struct {
                 });
             }
 
+            if (run.rtl) std.mem.reverse(font.shape.Cell, self.cell_buf.items);
             return self.cell_buf.items;
         }
 
@@ -119,6 +120,9 @@ pub const Shaper = struct {
             });
         }
 
+        // RTL runs add clusters in logical order, so the x values go down.
+        // The renderer needs them in screen order.
+        if (run.rtl) std.mem.reverse(font.shape.Cell, self.cell_buf.items);
         return self.cell_buf.items;
     }
 

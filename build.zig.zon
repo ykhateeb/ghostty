@@ -54,12 +54,6 @@
             .url = "https://deps.files.ghostty.org/uucode-ea62149739404a73c202b48a33bf6dd2af4bd9b0.tar.gz",
             .hash = "uucode-0.2.0-ZZjBPoGFVgCiflJNFc6Io8xzC67B6PA5bUkk4LT0kCxg",
         },
-        .itijah = .{
-            // DiaaEddin/itijah v0.2.1
-            .url = "https://github.com/DiaaEddin/itijah/archive/refs/tags/v0.2.1.tar.gz",
-            .hash = "itijah-0.2.1-keFZYfC1AwAKbdNB2ksZYamTycTESResjOdSkE40GkLX",
-            .lazy = true,
-        },
         .zig_wayland = .{
             // codeberg ifreund/zig-wayland
             .url = "https://deps.files.ghostty.org/zig_wayland-27dda01712ddf3cb46ebd93380d88b01a7c828f8.tar.gz",

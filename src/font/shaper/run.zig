@@ -19,6 +19,21 @@ fn codepointIsRtl(cp: u32) ?bool {
     };
 }
 
+/// True if the codepoint can change the visual order of an LTR line.
+fn codepointNeedsBidi(cp: u21) bool {
+    return switch (itijah.unicode.bidiClass(cp)) {
+        .right_to_left,
+        .right_to_left_arabic,
+        .arabic_number,
+        .right_to_left_embedding,
+        .right_to_left_override,
+        .right_to_left_isolate,
+        .first_strong_isolate,
+        => true,
+        else => false,
+    };
+}
+
 /// A single text run. A text run is only valid for one Shaper instance and
 /// until the next run is created. A text run never goes across multiple
 /// rows in a terminal, so it is guaranteed to always be one line.
@@ -65,6 +80,8 @@ pub const RunIterator = struct {
     layout_ready: bool = false,
     max: usize = 0,
     visual_runs: []const VisualRun = &.{},
+    // Backing storage for the single run of a row with no RTL text.
+    ltr_run: [1]VisualRun = undefined,
 
     pub fn next(self: *RunIterator, alloc: Allocator) !?TextRun {
         const slice = &self.opts.cells;
@@ -211,7 +228,7 @@ pub const RunIterator = struct {
                 // the current run's font also supports it.
                 if (font_info.idx != current_font) {
                     const cp = cell.codepoint();
-                    const is_neutral_in_current_font = cp != 0 and
+                    const is_neutral_in_current_font = rtl and cp != 0 and
                         codepointIsRtl(cp) == null and
                         self.opts.grid.hasCodepoint(current_font, cp, presentation);
                     if (!is_neutral_in_current_font) break;
@@ -266,7 +283,7 @@ pub const RunIterator = struct {
 
                 if (font_info.idx != current_font) {
                     const cp = cell.codepoint();
-                    const is_neutral_in_current_font = cp != 0 and
+                    const is_neutral_in_current_font = rtl and cp != 0 and
                         codepointIsRtl(cp) == null and
                         self.opts.grid.hasCodepoint(current_font, cp, presentation);
                     if (!is_neutral_in_current_font) continue;
@@ -340,6 +357,22 @@ pub const RunIterator = struct {
 
         if (self.max == 0) {
             self.visual_runs = &.{};
+            return;
+        }
+
+        // Fast path: a row with no RTL codepoint is one LTR run, so we
+        // skip the bidi pass and its allocation.
+        const needs_bidi = for (cells[0..self.max]) |cell| {
+            if (codepointNeedsBidi(bidiCodepoint(cell))) break true;
+        } else false;
+        if (!needs_bidi) {
+            self.ltr_run = .{.{
+                .visual_start = 0,
+                .logical_start = 0,
+                .len = @intCast(self.max),
+                .is_rtl = false,
+            }};
+            self.visual_runs = &self.ltr_run;
             return;
         }
 
