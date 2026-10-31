@@ -89,7 +89,7 @@ pub const RunIterator = struct {
         const graphemes: []const []const u21 = slice.items(.grapheme);
         const styles: []const terminal.Style = slice.items(.style);
 
-        if (!self.layout_ready) try self.resolveRowLayout(alloc, cells);
+        try self.layout(alloc);
         if (self.max == 0) return null;
 
         // We're over at the max.
@@ -97,8 +97,7 @@ pub const RunIterator = struct {
 
         // Invisible cells don't have any glyphs rendered, so we skip them.
         while (self.i < self.max) {
-            const vr = findVisualRun(self.visual_runs, self.i) orelse break;
-            const logical_i: usize = @intCast(itijah.logicalIndexForVisual(vr, @intCast(self.i)));
+            const logical_i = self.logicalColumn(self.i);
             if (!(cells[logical_i].hasStyling() and styles[logical_i].flags.invisible)) break;
             self.i += 1;
         }
@@ -117,10 +116,7 @@ pub const RunIterator = struct {
             const rtl = bidi_run.is_rtl;
 
             // Style is anchored to the first visual cell in this candidate run.
-            const start_logical: usize = @intCast(itijah.logicalIndexForVisual(
-                bidi_run,
-                @intCast(self.i),
-            ));
+            const start_logical = self.logicalColumn(self.i);
             const style: terminal.Style = if (cells[start_logical].hasStyling())
                 styles[start_logical]
             else
@@ -130,18 +126,17 @@ pub const RunIterator = struct {
             // Find the run boundary in visual order.
             var j: usize = self.i;
             while (j < bidi_run_end) : (j += 1) {
-                const logical_j: usize = @intCast(itijah.logicalIndexForVisual(
-                    bidi_run,
-                    @intCast(j),
-                ));
+                const logical_j = self.logicalColumn(j);
                 const cell: *const terminal.page.Cell = &cells[logical_j];
 
                 // If we have a selection and we're at a boundary point, then
-                // we break the run here.
+                // we break the run here. RTL runs never split at the
+                // selection, the cursor, or a color change: the renderer
+                // colors each cell, and a split breaks letter joining.
                 if (self.opts.selection) |bounds| {
-                    if (j > self.i) {
-                        if (bounds[0] > 0 and j == bounds[0]) break;
-                        if (bounds[1] > 0 and j == bounds[1] + 1) break;
+                    if (!rtl and j > self.i) {
+                        if (bounds[0] > 0 and logical_j == bounds[0]) break;
+                        if (bounds[1] > 0 and logical_j == bounds[1] + 1) break;
                     }
                 }
 
@@ -155,11 +150,15 @@ pub const RunIterator = struct {
                 // This prevents a single glyph for ">=" to be rendered with
                 // one color when the two components have different styling.
                 if (j > self.i) style_change: {
-                    const prev_logical: usize = @intCast(itijah.logicalIndexForVisual(
-                        bidi_run,
-                        @intCast(j - 1),
-                    ));
-                    const prev_cell = cells[prev_logical];
+                    const cell_style: terminal.Style = if (cell.hasStyling()) styles[logical_j] else .{};
+                    if (rtl) {
+                        // Invisible cells draw no glyphs, so they never join a run.
+                        if (cell_style.flags.invisible or
+                            fontStyleForStyle(cell_style) != run_font_style) break;
+                        break :style_change;
+                    }
+
+                    const prev_cell = cells[self.logicalColumn(j - 1)];
 
                     // If the prev cell and this cell are both plain
                     // codepoints then we check if they are commonly "bad"
@@ -191,7 +190,7 @@ pub const RunIterator = struct {
                     // The style is different. We allow differing background
                     // styles but any other change results in a new run.
                     const c1 = comparableStyle(style);
-                    const c2 = comparableStyle(if (cell.hasStyling()) styles[logical_j] else .{});
+                    const c2 = comparableStyle(cell_style);
                     if (!c1.eql(c2)) break;
                 }
 
@@ -200,13 +199,10 @@ pub const RunIterator = struct {
 
                 // If our cursor is on this line then we break the run around
                 // the cursor.
-                if (!cell.hasGrapheme()) {
+                if (!rtl and !cell.hasGrapheme()) {
                     if (self.opts.cursor_x) |cursor_x| {
-                        if (self.i == cursor_x and j == self.i + 1) break;
-                        if (self.i < cursor_x and j == cursor_x) {
-                            assert(j > 0);
-                            break;
-                        }
+                        if (start_logical == cursor_x and j == self.i + 1) break;
+                        if (start_logical < cursor_x and logical_j == cursor_x) break;
                     }
                 }
 
@@ -247,13 +243,16 @@ pub const RunIterator = struct {
                 continue;
             }
 
+            // A swapped wide pair can sit one cell outside this range,
+            // so widen it by one cell and filter by visual column.
             const logical_range = itijah.logicalRangeForVisualSlice(
                 bidi_run,
                 @intCast(self.i),
                 @intCast(j),
             );
-            const logical_start: usize = @intCast(logical_range.start);
-            const logical_end: usize = @intCast(logical_range.end);
+            const widen: u32 = @intFromBool(rtl);
+            const logical_start = @max(logical_range.start, bidi_run.logical_start + widen) - widen;
+            const logical_end = @min(logical_range.end + widen, bidi_run.logicalEnd());
 
             // Prepare the shaping backend and build the run contents in LOGICAL
             // order for shaping correctness.
@@ -262,8 +261,9 @@ pub const RunIterator = struct {
 
             var hasher = Hasher.init(0);
             for (logical_start..logical_end) |logical_j| {
-                const visual_idx = itijah.visualIndexForLogical(bidi_run, @intCast(logical_j));
-                const cluster: u32 = visual_idx - @as(u32, @intCast(self.i));
+                const visual_idx = self.visualColumn(logical_j);
+                if (visual_idx < self.i or visual_idx >= j) continue;
+                const cluster: u32 = @intCast(visual_idx - self.i);
                 const cell: *const terminal.page.Cell = &cells[logical_j];
 
                 switch (cell.wide) {
@@ -341,12 +341,41 @@ pub const RunIterator = struct {
         return null;
     }
 
-    fn resolveRowLayout(
-        self: *RunIterator,
-        alloc: Allocator,
-        cells: []const terminal.page.Cell,
-    ) !void {
+    /// Logical column of the cell shown at visual column `x`.
+    /// Call `layout` first.
+    pub fn logicalColumn(self: *const RunIterator, x: usize) usize {
+        const run = findVisualRun(self.visual_runs, x) orelse return x;
+        const l: usize = itijah.logicalIndexForVisual(run, @intCast(x));
+        return self.widePartner(run, l) orelse l;
+    }
+
+    /// Visual column of the cell at logical column `x`.
+    /// Call `layout` first.
+    pub fn visualColumn(self: *const RunIterator, x: usize) usize {
+        const run = findLogicalRun(self.visual_runs, x) orelse return x;
+        return itijah.visualIndexForLogical(run, @intCast(self.widePartner(run, x) orelse x));
+    }
+
+    /// The bidi pass reverses a wide cell and its spacer tail in an RTL
+    /// run, which puts the spacer on the left. The column maps swap the
+    /// pair back so the wide cell stays on the left, where its glyph
+    /// starts. Returns the other cell of a swapped pair.
+    fn widePartner(self: *const RunIterator, run: VisualRun, l: usize) ?usize {
+        if (!run.is_rtl) return null;
+        const cells = self.opts.cells.items(.raw);
+        return switch (cells[l].wide) {
+            .wide => if (l + 1 < run.logicalEnd() and cells[l + 1].wide == .spacer_tail) l + 1 else null,
+            .spacer_tail => if (l > run.logical_start and cells[l - 1].wide == .wide) l - 1 else null,
+            .narrow, .spacer_head => null,
+        };
+    }
+
+    /// Resolve the bidi layout of the row. `next` calls this, so call it
+    /// directly only to use the column maps without iterating.
+    pub fn layout(self: *RunIterator, alloc: Allocator) !void {
+        if (self.layout_ready) return;
         self.layout_ready = true;
+        const cells: []const terminal.page.Cell = self.opts.cells.items(.raw);
         self.max = max: {
             for (0..cells.len) |i| {
                 const rev_i = cells.len - i - 1;
@@ -384,13 +413,12 @@ pub const RunIterator = struct {
             bidi_codepoints[i] = bidiCodepoint(cell);
         }
 
-        const layout = try itijah.resolveVisualLayoutScratch(
+        self.visual_runs = (try itijah.resolveVisualLayoutScratch(
             alloc,
             self.hooks.bidiLayoutScratch(),
             bidi_codepoints,
             .{ .base_dir = .ltr },
-        );
-        self.visual_runs = layout.runs;
+        )).runs;
     }
 
     fn addCodepoint(self: *RunIterator, hasher: anytype, cp: u32, cluster: u32) !void {
@@ -524,6 +552,14 @@ fn presentationForCell(cell: *const terminal.page.Cell, grapheme: []const u21) ?
         0xFE0F => .emoji,
         else => null,
     };
+}
+
+fn findLogicalRun(visual_runs: []const VisualRun, logical_index: usize) ?VisualRun {
+    for (visual_runs) |run| {
+        if (logical_index >= run.logical_start and logical_index < run.logicalEnd()) return run;
+    }
+
+    return null;
 }
 
 fn findVisualRun(visual_runs: []const VisualRun, visual_index: usize) ?VisualRun {

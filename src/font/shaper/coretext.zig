@@ -2779,6 +2779,101 @@ test "shape LTR neutral RTL splits and sets direction" {
     try testing.expect(runs[1].offset > 0);
 }
 
+test "run iterator column maps for RTL with a wide cell" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .julia_mono);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // Logical columns: א=0 ב=1 😀=2 (spacer tail=3) ג=4 ד=5.
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("אב😀גד");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var it = testdata.shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    try it.layout(alloc);
+
+    // The row is reversed, but the wide cell stays left of its spacer.
+    const expected = [_]usize{ 5, 4, 2, 3, 1, 0 };
+    for (expected, 0..) |l, x| {
+        try testing.expectEqual(l, it.logicalColumn(x));
+        try testing.expectEqual(x, it.visualColumn(l));
+    }
+
+    // Empty cells after the text keep their column.
+    try testing.expectEqual(@as(usize, 8), it.logicalColumn(8));
+}
+
+test "run iterator keeps an RTL word in one run across selection and cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("مرحبا");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // A split inside the word would break the joining of its letters.
+    var it = testdata.shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+        .selection = .{ 1, 2 },
+        .cursor_x = 3,
+    });
+    const run = (try it.next(alloc)).?;
+    try testing.expect(run.rtl);
+    try testing.expectEqual(@as(u16, 5), run.cells);
+    try testing.expect(try it.next(alloc) == null);
+}
+
+test "run iterator splits an RTL run at an invisible cell" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("مر\x1b[8mح\x1b[0mبا");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // The invisible cell draws no glyph, so it is in no run.
+    var it = testdata.shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    var cells: u16 = 0;
+    while (try it.next(alloc)) |run| cells += run.cells;
+    try testing.expectEqual(@as(u16, 4), cells);
+}
+
 test "shape hebrew RTL" {
     const testing = std.testing;
     const alloc = testing.allocator;
