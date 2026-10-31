@@ -372,13 +372,26 @@ pub const Shaper = struct {
         defer arena.deinit();
         const alloc = arena.allocator();
 
-        const attr_dict: *macos.foundation.Dictionary = try self.getFont(
+        var attr_dict: *macos.foundation.Dictionary = try self.getFont(
             run.grid,
             run.font_index,
         );
 
-        // Make room for the attributed string, CTTypesetter, and CTLine.
-        try self.cf_release_pool.ensureUnusedCapacity(self.alloc, 4);
+        // Make room for the attributed string, CTTypesetter, CTLine, and
+        // the RTL attributes.
+        try self.cf_release_pool.ensureUnusedCapacity(self.alloc, 6);
+
+        // A terminal gives each letter its own cell, so a ligature of a
+        // full word, such as Allah, leaves empty cells. In RTL text, keep
+        // only the necessary ligatures, such as lam-alef.
+        if (run.rtl) {
+            const essential = try macos.foundation.Number.create(.int, &@as(c_int, 0));
+            self.cf_release_pool.appendAssumeCapacity(essential);
+            const dict = try macos.foundation.MutableDictionary.createMutableCopy(0, attr_dict);
+            self.cf_release_pool.appendAssumeCapacity(dict);
+            dict.setValue(macos.text.c.kCTLigatureAttributeName, essential);
+            attr_dict = @ptrCast(dict);
+        }
 
         const str = try macos.foundation.String.createWithCharactersNoCopy(state.unichars.items);
         self.cf_release_pool.appendAssumeCapacity(str);
@@ -635,7 +648,7 @@ pub const Shaper = struct {
             }
         }
 
-        if (run.rtl) try self.spreadLigatures(alloc, run, sources.items);
+        if (run.rtl) try self.placeRtlGlyphs(alloc, run, sources.items);
 
         // CoreText may return RTL or otherwise non-monotonic glyph runs. The
         // renderer expects cells sorted by increasing terminal x, so normalize
@@ -663,11 +676,15 @@ pub const Shaper = struct {
         advance: f64,
     };
 
+    /// Align each glyph to the right edge of its cell. RTL text starts on
+    /// the right, so a glyph wider than its cell goes left, under the
+    /// letter that it joins, and not into the next cell or the cursor.
+    ///
     /// A ligature such as lam-alef covers two or more cells, but its
     /// glyph is narrower, so it leaves an empty cell. Center each ligature
     /// on its cells. If the letter on its right joins to it, fill the gap
     /// on that side with tatweel glyphs, so the word stays connected.
-    fn spreadLigatures(
+    fn placeRtlGlyphs(
         self: *Shaper,
         alloc: Allocator,
         run: font.shape.TextRun,
@@ -702,12 +719,14 @@ pub const Shaper = struct {
                 min = @min(min, cp.cluster);
                 max = @max(max, cp.cluster);
             }
-            if (min >= max) continue;
+            if (min > max) continue;
 
-            // Move the glyph, and the marks drawn on its cells, to the center.
+            // Move the glyph, and the marks drawn on its cells, to the
+            // right edge of one cell or the center of a ligature's cells.
             const span: f64 = @floatFromInt(max - min + 1);
+            const space = span * cell_width - source.advance;
             const left = @as(f64, @floatFromInt(min)) * cell_width +
-                (span * cell_width - source.advance) / 2;
+                if (min == max) space else space / 2;
             const ligature = self.cell_buf.items[g];
             const now = @as(f64, @floatFromInt(ligature.x)) * cell_width +
                 @as(f64, @floatFromInt(ligature.x_offset));
@@ -716,7 +735,7 @@ pub const Shaper = struct {
                 if (cell.x >= min and cell.x <= max) cell.x_offset += delta;
             }
 
-            if (!joinsRight(codepoints, source.index)) continue;
+            if (min == max or !joinsRight(codepoints, source.index)) continue;
             if (tatweel == null) tatweel = try tatweelGlyph(run);
             const fill = tatweel.? orelse continue;
 
@@ -3071,6 +3090,82 @@ test "shape centers lam-alef and fills a joined side with tatweel" {
         }
         try testing.expect(centered);
         try testing.expectEqual(case.tatweels, tatweels);
+    }
+}
+
+test "shape keeps only the necessary RTL ligatures" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Courier New has an Allah ligature in its standard ligatures.
+    var testdata = try testShaperWithDiscoveredFont(alloc, "Courier New");
+    defer testdata.deinit();
+
+    const Case = struct { text: []const u8, glyphs: usize };
+    for ([_]Case{
+        // Allah stays four letters, one in each cell.
+        .{ .text = "الله", .glyphs = 4 },
+        // Lam-alef is a necessary ligature.
+        .{ .text = "لا", .glyphs = 1 },
+    }) |case| {
+        var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+        defer t.deinit(alloc);
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(case.text);
+
+        var state: terminal.RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &t);
+
+        var it = testdata.shaper.runIterator(.{
+            .grid = testdata.grid,
+            .cells = state.row_data.get(0).cells.slice(),
+        });
+        const run = (try it.next(alloc)).?;
+        try testing.expectEqual(case.glyphs, (try testdata.shaper.shape(run)).len);
+    }
+}
+
+test "shape aligns RTL letters to the right edge of their cells" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Geeza Pro is proportional, so its letters are not one cell wide.
+    var testdata = try testShaperWithDiscoveredFont(alloc, "Geeza Pro");
+    defer testdata.deinit();
+    const cell_width: f64 = @floatFromInt(testdata.grid.metrics.cell_width);
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("بسم");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var it = testdata.shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    const run = (try it.next(alloc)).?;
+    const face = try testdata.grid.resolver.collection.getFace(run.font_index);
+
+    // The right edge of the last letter must not go into the next cell,
+    // where the cursor is.
+    const cells = try testdata.shaper.shape(run);
+    try testing.expectEqual(3, cells.len);
+    for (cells) |cell| {
+        const advance = face.font.getAdvancesForGlyphs(
+            .horizontal,
+            &.{@intCast(cell.glyph_index)},
+            null,
+        );
+        const right = @as(f64, @floatFromInt(cell.x)) * cell_width +
+            @as(f64, @floatFromInt(cell.x_offset)) + advance;
+        try testing.expectApproxEqAbs((@as(f64, @floatFromInt(cell.x)) + 1) * cell_width, right, 1);
     }
 }
 
