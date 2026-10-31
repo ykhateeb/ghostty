@@ -158,6 +158,17 @@ pub const Shaper = struct {
         return dict;
     }
 
+    /// Create typesetter options that force one bidi embedding level:
+    /// 0 for LTR or 1 for RTL.
+    fn makeEmbeddingDict(level: c_int) !*macos.foundation.Dictionary {
+        const num = try macos.foundation.Number.create(.int, &level);
+        defer num.release();
+        return try macos.foundation.Dictionary.create(
+            &.{macos.c.kCTTypesetterOptionForcedEmbeddingLevel},
+            &.{num},
+        );
+    }
+
     /// The cell_buf argument is the buffer to use for storing shaped results.
     /// This should be at least the number of columns in the terminal.
     pub fn init(alloc: Allocator, opts: font.shape.Options) !Shaper {
@@ -196,24 +207,9 @@ pub const Shaper = struct {
         //
         // See: https://github.com/mitchellh/ghostty/issues/1737
         // See: https://github.com/mitchellh/ghostty/issues/1442
-        const typesetter_attr_dict = dict: {
-            const num = try macos.foundation.Number.create(.int, &@as(c_int, 0));
-            defer num.release();
-            break :dict try macos.foundation.Dictionary.create(
-                &.{macos.c.kCTTypesetterOptionForcedEmbeddingLevel},
-                &.{num},
-            );
-        };
+        const typesetter_attr_dict = try makeEmbeddingDict(0);
         errdefer typesetter_attr_dict.release();
-
-        const typesetter_attr_dict_rtl = dict: {
-            const num = try macos.foundation.Number.create(.int, &@as(c_int, 1));
-            defer num.release();
-            break :dict try macos.foundation.Dictionary.create(
-                &.{macos.c.kCTTypesetterOptionForcedEmbeddingLevel},
-                &.{num},
-            );
-        };
+        const typesetter_attr_dict_rtl = try makeEmbeddingDict(1);
         errdefer typesetter_attr_dict_rtl.release();
 
         // Create the CF release thread.
@@ -426,9 +422,9 @@ pub const Shaper = struct {
 
         // This keeps track of the cell starting x and cluster.
         var cell_offset: Offset = .{};
-        const anchor_sentinel = std.math.nan(f64);
+        // NaN marks a cluster with no anchor yet.
         self.cluster_anchor_x.clearRetainingCapacity();
-        try self.cluster_anchor_x.appendNTimes(self.alloc, anchor_sentinel, run.cells);
+        try self.cluster_anchor_x.appendNTimes(self.alloc, std.math.nan(f64), run.cells);
 
         // For debugging positions, turn this on:
         //var run_offset_y: f64 = 0.0;
@@ -493,17 +489,8 @@ pub const Shaper = struct {
                     const is_after_glyph_from_current_or_next_clusters =
                         cluster <= run_offset.cluster;
 
-                    const is_first_codepoint_in_cluster = blk: {
-                        var i = index;
-                        while (i > 0) {
-                            i -= 1;
-                            const codepoint = state.codepoints.items[i];
-
-                            // Skip surrogate pair padding
-                            if (codepoint.codepoint == 0) continue;
-                            break :blk codepoint.cluster != cluster;
-                        } else break :blk true;
-                    };
+                    const is_first_codepoint_in_cluster =
+                        isFirstInCluster(state.codepoints.items, index);
 
                     // We need to reset the `cell_offset` at the start of a new
                     // cluster, but we do that conditionally if the codepoint
@@ -546,31 +533,23 @@ pub const Shaper = struct {
                                 .cluster = cluster,
                                 .x = reset_x,
                             };
-
-                            const cluster_i: usize = @intCast(cluster);
-                            if (cluster_i < self.cluster_anchor_x.items.len) {
-                                self.cluster_anchor_x.items[cluster_i] = reset_x;
-                            }
+                            if (self.anchor(cluster)) |a| a.* = reset_x;
                         }
                     } else if (!run.rtl and !is_combining_mark) {
                         // In LTR scripts, a cluster's first codepoint can be
                         // absent from the glyph stream (due to ligature
                         // composition). If this is the first glyph we see for
                         // that cluster, establish an anchor now.
-                        const cluster_i: usize = @intCast(cluster);
-                        if (cluster_i < self.cluster_anchor_x.items.len and
-                            std.math.isNan(self.cluster_anchor_x.items[cluster_i]))
-                        {
+                        if (self.anchor(cluster)) |a| if (std.math.isNan(a.*)) {
                             cell_offset = .{
                                 .cluster = cluster,
                                 .x = run_offset.x,
                             };
-                            self.cluster_anchor_x.items[cluster_i] = run_offset.x;
-                        }
+                            a.* = run_offset.x;
+                        };
                     } else if (run.rtl and is_combining_mark) {
-                        const cluster_i: usize = @intCast(cluster);
-                        if (cluster_i < self.cluster_anchor_x.items.len) {
-                            const anchor_x = self.cluster_anchor_x.items[cluster_i];
+                        if (self.anchor(cluster)) |a| {
+                            const anchor_x = a.*;
                             // Keep this scoped to Arabic RTL marks only. Other
                             // scripts can also emit marks out of logical order,
                             // but they do not all want the Arabic "attach back
@@ -592,34 +571,19 @@ pub const Shaper = struct {
                                     .cluster = cluster,
                                     .x = position.x,
                                 };
-                                self.cluster_anchor_x.items[cluster_i] = position.x;
+                                a.* = position.x;
                             }
                         }
                     }
-                } else if (run.rtl and source_codepoint != 0 and !is_combining_mark) {
-                    const is_first_codepoint_in_cluster = blk: {
-                        var i = index;
-                        while (i > 0) {
-                            i -= 1;
-                            const codepoint = state.codepoints.items[i];
-
-                            // Skip surrogate pair padding
-                            if (codepoint.codepoint == 0) continue;
-                            break :blk codepoint.cluster != cluster;
-                        } else break :blk true;
-                    };
-
+                } else if (run.rtl and source_codepoint != 0 and !is_combining_mark and
+                    isFirstInCluster(state.codepoints.items, index))
+                {
                     // In RTL runs, a combining mark can establish a cluster
                     // anchor before the base glyph arrives. Re-anchor to the
                     // base glyph position once the first logical codepoint in
                     // the cluster is seen.
-                    if (is_first_codepoint_in_cluster) {
-                        const cluster_i: usize = @intCast(cluster);
-                        cell_offset.x = position.x;
-                        if (cluster_i < self.cluster_anchor_x.items.len) {
-                            self.cluster_anchor_x.items[cluster_i] = position.x;
-                        }
-                    }
+                    cell_offset.x = position.x;
+                    if (self.anchor(cluster)) |a| a.* = position.x;
                 }
 
                 // For debugging positions, turn this on:
@@ -668,6 +632,12 @@ pub const Shaper = struct {
         }
 
         return self.cell_buf.items;
+    }
+
+    /// The x anchor of a cluster, or null if the cluster is not in the run.
+    fn anchor(self: *Shaper, cluster: u32) ?*f64 {
+        const anchors = self.cluster_anchor_x.items;
+        return if (cluster < anchors.len) &anchors[cluster] else null;
     }
 
     const GlyphSource = struct {
@@ -1067,6 +1037,19 @@ pub const Shaper = struct {
         }
     }
 };
+
+/// True if no codepoint before `index` is in the same cluster.
+fn isFirstInCluster(codepoints: []const Shaper.Codepoint, index: usize) bool {
+    const cluster = codepoints[index].cluster;
+    var i = index;
+    while (i > 0) {
+        i -= 1;
+        // Skip surrogate pair padding
+        if (codepoints[i].codepoint == 0) continue;
+        return codepoints[i].cluster != cluster;
+    }
+    return true;
+}
 
 fn isMark(cp: u32) bool {
     return unicode.table.get(@intCast(cp)).width_zero_in_grapheme;

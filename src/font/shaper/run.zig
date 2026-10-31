@@ -9,13 +9,16 @@ const autoHash = std.hash.autoHash;
 const Hasher = std.hash.Wyhash;
 const VisualRun = itijah.VisualRun;
 
-/// Classify a codepoint by bidi strength.
-/// Returns null for neutrals (spaces/punctuation).
-fn codepointIsRtl(cp: u32) ?bool {
+/// True if the codepoint has no strong direction (space, punctuation).
+fn codepointIsNeutral(cp: u32) bool {
     return switch (itijah.unicode.bidiClass(@intCast(cp))) {
-        .right_to_left, .right_to_left_arabic => true,
-        .left_to_right, .european_number, .arabic_number => false,
-        else => null,
+        .right_to_left,
+        .right_to_left_arabic,
+        .left_to_right,
+        .european_number,
+        .arabic_number,
+        => false,
+        else => true,
     };
 }
 
@@ -294,16 +297,9 @@ pub const RunIterator = struct {
                     have_font = true;
                 }
 
-                // If our fonts are not equal, then we're done with our run —
-                // UNLESS the codepoint is neutral (space, punctuation) and
-                // the current run's font also supports it.
-                if (font_info.idx != current_font) {
-                    const cp = cell.codepoint();
-                    const is_neutral_in_current_font = rtl and cp != 0 and
-                        codepointIsRtl(cp) == null and
-                        self.opts.grid.hasCodepoint(current_font, cp, presentation);
-                    if (!is_neutral_in_current_font) break;
-                }
+                // If our fonts are not equal, then we're done with our run.
+                if (font_info.idx != current_font and
+                    !self.isNeutralInFont(rtl, cell, current_font, presentation)) break;
             }
 
             // Defensive: ensure forward progress.
@@ -356,13 +352,8 @@ pub const RunIterator = struct {
                     presentation,
                 );
 
-                if (font_info.idx != current_font) {
-                    const cp = cell.codepoint();
-                    const is_neutral_in_current_font = rtl and cp != 0 and
-                        codepointIsRtl(cp) == null and
-                        self.opts.grid.hasCodepoint(current_font, cp, presentation);
-                    if (!is_neutral_in_current_font) continue;
-                }
+                if (font_info.idx != current_font and
+                    !self.isNeutralInFont(rtl, cell, current_font, presentation)) continue;
 
                 // If we're a fallback character and that fallback is in the
                 // current run font, add it directly.
@@ -426,6 +417,20 @@ pub const RunIterator = struct {
             self.opts.cells.items(.raw),
         );
         return self.row.?;
+    }
+
+    /// True if an RTL run keeps a neutral cell (space, punctuation) that
+    /// the run's font supports, so the run does not split at that cell.
+    fn isNeutralInFont(
+        self: *RunIterator,
+        rtl: bool,
+        cell: *const terminal.page.Cell,
+        idx: font.Collection.Index,
+        presentation: ?font.Presentation,
+    ) bool {
+        const cp = cell.codepoint();
+        return rtl and cp != 0 and codepointIsNeutral(cp) and
+            self.opts.grid.hasCodepoint(idx, cp, presentation);
     }
 
     fn addCodepoint(self: *RunIterator, hasher: anytype, cp: u32, cluster: u32) !void {
