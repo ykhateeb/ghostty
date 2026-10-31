@@ -12,6 +12,7 @@ pub const web_canvas = @import("shaper/web_canvas.zig");
 pub const Cache = @import("shaper/Cache.zig");
 pub const TextRun = run.TextRun;
 pub const RunIterator = run.RunIterator;
+pub const RowLayout = run.RowLayout;
 pub const Feature = feature.Feature;
 pub const FeatureList = feature.FeatureList;
 pub const default_features = feature.default_features;

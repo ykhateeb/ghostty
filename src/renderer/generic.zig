@@ -2825,8 +2825,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :cursor_color state.colors.foreground;
                 };
 
+                // The cursor position is a logical column. On RTL rows
+                // its cell is drawn at a different visual column.
+                var cursor = state.cursor;
+                cursor.viewport.?.x = cursor_x: {
+                    var it = self.font_shaper.runIterator(.{
+                        .grid = self.font_grid,
+                        .cells = state.row_data.items(.cells)[cursor_vp.y].slice(),
+                    });
+                    const row = it.layout(self.alloc) catch break :cursor_x cursor_vp.x;
+                    break :cursor_x @intCast(row.visualColumn(cursor_vp.x));
+                };
+
                 self.addCursor(
-                    &state.cursor,
+                    &cursor,
                     style,
                     cursor_color,
                 );
@@ -2840,8 +2852,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // to move back one cell. The saturate is to ensure we don't
                         // overflow but this shouldn't happen with well-formed input.
                         switch (wide) {
-                            .narrow, .spacer_head, .wide => cursor_vp.x,
-                            .spacer_tail => cursor_vp.x -| 1,
+                            .narrow, .spacer_head, .wide => cursor.viewport.?.x,
+                            .spacer_tail => cursor.viewport.?.x -| 1,
                         },
                         @intCast(cursor_vp.y),
                     };
@@ -2990,11 +3002,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             var shaper_cells: ?[]const font.shape.Cell = null;
             var shaper_cells_i: usize = 0;
 
-            for (
-                0..,
-                cells_raw[0..cells_len],
-                cells_style[0..cells_len],
-            ) |x, *cell, *managed_style| {
+            // We walk visual columns because the shaper places glyphs in
+            // visual order. Each column reads its cell from its logical
+            // column, which differs from the visual column in RTL text.
+            const row_layout = try run_iter.layout(self.alloc);
+            for (0..cells_len) |x| {
+                const lx = row_layout.logicalColumn(x);
+                const cell = &cells_raw[lx];
+                const managed_style = &cells_style[lx];
+
                 // If this cell falls within our preedit range then we
                 // skip this because preedits are setup separately.
                 if (preedit_range) |range| preedit: {
@@ -3074,9 +3090,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     // Selection should take the highest precedence.
                     const x_compare = if (wide == .spacer_tail)
-                        x -| 1
+                        lx -| 1
                     else
-                        x;
+                        lx;
                     if (selection) |sel| {
                         if (x_compare >= sel[0] and
                             x_compare <= sel[1]) break :selected .selection;
@@ -3247,7 +3263,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // distinguish them.
                 const underline: terminal.Attribute.Underline = underline: {
                     if (links.contains(.{
-                        .x = @intCast(x),
+                        .x = @intCast(lx),
                         .y = @intCast(y),
                     })) {
                         break :underline if (style.flags.underline == .single)
@@ -3339,6 +3355,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }) {
                         self.addGlyph(
                             @intCast(x),
+                            lx,
                             @intCast(y),
                             state.cols,
                             cells_raw,
@@ -3477,6 +3494,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         fn addGlyph(
             self: *Self,
             x: terminal.size.CellCountInt,
+            /// The logical column of the cell, which differs from `x` in RTL text.
+            lx: usize,
             y: terminal.size.CellCountInt,
             cols: usize,
             cell_raws: []const terminal.page.Cell,
@@ -3485,7 +3504,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             color: terminal.color.RGB,
             alpha: u8,
         ) !void {
-            const cell = cell_raws[x];
+            const cell = cell_raws[lx];
             const cp = cell.codepoint();
 
             // Render
@@ -3505,11 +3524,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (cellpkg.isSymbol(cp)) .{
                             .size = .fit,
                         } else .none,
-                    .constraint_width = constraintWidth(
-                        cell_raws,
-                        x,
-                        cols,
-                    ),
+                    // The neighbour checks assume LTR order, so RTL glyphs
+                    // stay in their own cells.
+                    .constraint_width = if (shaper_run.rtl)
+                        cell.gridWidth()
+                    else
+                        constraintWidth(cell_raws, lx, cols),
                 },
             );
 

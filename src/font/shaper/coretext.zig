@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const assert = @import("../../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const macos = @import("macos");
+const itijah = @import("itijah");
+const bidi_helpers = @import("bidi_helpers.zig");
 const font = @import("../main.zig");
 const os = @import("../../os/main.zig");
 const terminal = @import("../../terminal/main.zig");
@@ -51,11 +53,17 @@ pub const Shaper = struct {
 
     /// The shared memory used for shaping results.
     cell_buf: CellBuf,
+    /// Per-cluster x anchors captured when a cluster first establishes its
+    /// cell offset. This lets out-of-order combining marks re-anchor to the
+    /// correct base cluster.
+    cluster_anchor_x: std.ArrayListUnmanaged(f64),
 
     /// Cached attributes dict for creating CTTypesetter objects.
     /// The values in this never change so we can avoid overhead
     /// by just creating it once and saving it for reuse.
     typesetter_attr_dict: *macos.foundation.Dictionary,
+    /// Same as above but with embedding level 1 (RTL).
+    typesetter_attr_dict_rtl: *macos.foundation.Dictionary,
 
     /// List where we cache fonts, so we don't have to remake them for
     /// every single shaping operation.
@@ -78,6 +86,9 @@ pub const Shaper = struct {
     /// callback logic.
     cf_release_thread: *CFReleaseThread,
     cf_release_thr: std.Thread,
+
+    /// Scratch reused for terminal bidi layout resolution.
+    bidi_layout_scratch: itijah.VisualLayoutScratch = .{},
 
     const CellBuf = std.ArrayListUnmanaged(font.shape.Cell);
     const CodepointList = std.ArrayListUnmanaged(Codepoint);
@@ -147,6 +158,17 @@ pub const Shaper = struct {
         return dict;
     }
 
+    /// Create typesetter options that force one bidi embedding level:
+    /// 0 for LTR or 1 for RTL.
+    fn makeEmbeddingDict(level: c_int) !*macos.foundation.Dictionary {
+        const num = try macos.foundation.Number.create(.int, &level);
+        defer num.release();
+        return try macos.foundation.Dictionary.create(
+            &.{macos.c.kCTTypesetterOptionForcedEmbeddingLevel},
+            &.{num},
+        );
+    }
+
     /// The cell_buf argument is the buffer to use for storing shaped results.
     /// This should be at least the number of columns in the terminal.
     pub fn init(alloc: Allocator, opts: font.shape.Options) !Shaper {
@@ -173,34 +195,22 @@ pub const Shaper = struct {
         var run_state = RunState.init();
         errdefer run_state.deinit(alloc);
 
-        // For now we only support LTR text. If we shape RTL text then
-        // rendering will be very wrong so we need to explicitly force
-        // LTR no matter what.
+        // Use kCTTypesetterOptionForcedEmbeddingLevel to control BiDi
+        // embedding. The run iterator already splits at direction
+        // boundaries, so each CoreText line we create here is a single LTR or
+        // RTL shaping run.
+        //
+        // Setting the attributed string's writing direction instead looks
+        // tempting, but it changes CoreText line breaking behavior. In
+        // particular, trailing spaces in RTL text can be emitted as their own
+        // right-to-left run ahead of the rest of the line.
         //
         // See: https://github.com/mitchellh/ghostty/issues/1737
         // See: https://github.com/mitchellh/ghostty/issues/1442
-        //
-        // We used to do this by setting the writing direction attribute
-        // on the attributed string we used, but it seems like that will
-        // still allow some weird results, for example a single space at
-        // the end of a line composed of RTL characters will be cause it
-        // to output a run containing just that space, BEFORE it outputs
-        // the rest of the line as a separate run, very weirdly with the
-        // "right to left" flag set in the single space run's run status...
-        //
-        // So instead what we do is use a CTTypesetter to create our line,
-        // using the kCTTypesetterOptionForcedEmbeddingLevel attribute to
-        // force CoreText not to try doing any sort of BiDi, instead just
-        // treat all text as embedding level 0 (left to right).
-        const typesetter_attr_dict = dict: {
-            const num = try macos.foundation.Number.create(.int, &0);
-            defer num.release();
-            break :dict try macos.foundation.Dictionary.create(
-                &.{macos.c.kCTTypesetterOptionForcedEmbeddingLevel},
-                &.{num},
-            );
-        };
+        const typesetter_attr_dict = try makeEmbeddingDict(0);
         errdefer typesetter_attr_dict.release();
+        const typesetter_attr_dict_rtl = try makeEmbeddingDict(1);
+        errdefer typesetter_attr_dict_rtl.release();
 
         // Create the CF release thread.
         var cf_release_thread = try alloc.create(CFReleaseThread);
@@ -219,10 +229,12 @@ pub const Shaper = struct {
         return .{
             .alloc = alloc,
             .cell_buf = .empty,
+            .cluster_anchor_x = .empty,
             .run_state = run_state,
             .features = features,
             .features_no_default = features_no_default,
             .typesetter_attr_dict = typesetter_attr_dict,
+            .typesetter_attr_dict_rtl = typesetter_attr_dict_rtl,
             .cached_fonts = .empty,
             .cached_font_grid = 0,
             .cf_release_pool = .empty,
@@ -233,10 +245,13 @@ pub const Shaper = struct {
 
     pub fn deinit(self: *Shaper) void {
         self.cell_buf.deinit(self.alloc);
+        self.cluster_anchor_x.deinit(self.alloc);
         self.run_state.deinit(self.alloc);
         self.features.release();
         self.features_no_default.release();
         self.typesetter_attr_dict.release();
+        self.typesetter_attr_dict_rtl.release();
+        self.bidi_layout_scratch.deinit(self.alloc);
 
         {
             for (self.cached_fonts.items) |ft| {
@@ -353,13 +368,26 @@ pub const Shaper = struct {
         defer arena.deinit();
         const alloc = arena.allocator();
 
-        const attr_dict: *macos.foundation.Dictionary = try self.getFont(
+        var attr_dict: *macos.foundation.Dictionary = try self.getFont(
             run.grid,
             run.font_index,
         );
 
-        // Make room for the attributed string, CTTypesetter, and CTLine.
-        try self.cf_release_pool.ensureUnusedCapacity(self.alloc, 4);
+        // Make room for the attributed string, CTTypesetter, CTLine, and
+        // the RTL attributes.
+        try self.cf_release_pool.ensureUnusedCapacity(self.alloc, 6);
+
+        // A terminal gives each letter its own cell, so a ligature of a
+        // full word, such as Allah, leaves empty cells. In RTL text, keep
+        // only the necessary ligatures, such as lam-alef.
+        if (run.rtl) {
+            const essential = try macos.foundation.Number.create(.int, &@as(c_int, 0));
+            self.cf_release_pool.appendAssumeCapacity(essential);
+            const dict = try macos.foundation.MutableDictionary.createMutableCopy(0, attr_dict);
+            self.cf_release_pool.appendAssumeCapacity(dict);
+            dict.setValue(macos.text.c.kCTLigatureAttributeName, essential);
+            attr_dict = @ptrCast(dict);
+        }
 
         const str = try macos.foundation.String.createWithCharactersNoCopy(state.unichars.items);
         self.cf_release_pool.appendAssumeCapacity(str);
@@ -371,12 +399,16 @@ pub const Shaper = struct {
         );
         self.cf_release_pool.appendAssumeCapacity(attr_str);
 
-        // Create a typesetter from the attributed string and the cached
-        // attr dict. (See comment in init for more info on the attr dict.)
+        // Create a typesetter from the attributed string. Use the RTL
+        // embedding level dict for RTL runs so CoreText shapes correctly.
+        const ts_dict = if (run.rtl)
+            self.typesetter_attr_dict_rtl
+        else
+            self.typesetter_attr_dict;
         const typesetter =
             try macos.text.Typesetter.createWithAttributedStringAndOptions(
                 attr_str,
-                self.typesetter_attr_dict,
+                ts_dict,
             );
         self.cf_release_pool.appendAssumeCapacity(typesetter);
 
@@ -390,6 +422,9 @@ pub const Shaper = struct {
 
         // This keeps track of the cell starting x and cluster.
         var cell_offset: Offset = .{};
+        // NaN marks a cluster with no anchor yet.
+        self.cluster_anchor_x.clearRetainingCapacity();
+        try self.cluster_anchor_x.appendNTimes(self.alloc, std.math.nan(f64), run.cells);
 
         // For debugging positions, turn this on:
         //var run_offset_y: f64 = 0.0;
@@ -406,6 +441,10 @@ pub const Shaper = struct {
         // this, we check the run status for each run and if any aren't ltr
         // we set this to true, which indicates that we must sort our buffer.
         var non_ltr: bool = false;
+
+        // The source of each output glyph, which RTL runs need to place
+        // ligatures that cover more than one cell.
+        var sources: std.ArrayList(GlyphSource) = .empty;
 
         // CoreText may generate multiple runs even though our input to
         // CoreText is already split into runs by our own run iterator.
@@ -434,9 +473,13 @@ pub const Shaper = struct {
                 positions,
                 indices,
             ) |glyph, advance, position, index| {
-                // Our cluster is also our cell X position. If the cluster changes
-                // then we need to reset our current cell offsets.
+                // The cluster is the terminal cell this glyph belongs to.
+                // CoreText can report RTL glyphs in visual order with absolute
+                // glyph positions, so the current cluster does not always move
+                // left-to-right through the terminal row.
                 const cluster = state.codepoints.items[index].cluster;
+                const source_codepoint = state.codepoints.items[index].codepoint;
+                const is_combining_mark = source_codepoint != 0 and isMark(source_codepoint);
                 if (cell_offset.cluster != cluster) {
                     // We previously asserted that the new cluster is greater
                     // than cell_offset.cluster, but this isn't always true.
@@ -446,17 +489,8 @@ pub const Shaper = struct {
                     const is_after_glyph_from_current_or_next_clusters =
                         cluster <= run_offset.cluster;
 
-                    const is_first_codepoint_in_cluster = blk: {
-                        var i = index;
-                        while (i > 0) {
-                            i -= 1;
-                            const codepoint = state.codepoints.items[i];
-
-                            // Skip surrogate pair padding
-                            if (codepoint.codepoint == 0) continue;
-                            break :blk codepoint.cluster != cluster;
-                        } else break :blk true;
-                    };
+                    const is_first_codepoint_in_cluster =
+                        isFirstInCluster(state.codepoints.items, index);
 
                     // We need to reset the `cell_offset` at the start of a new
                     // cluster, but we do that conditionally if the codepoint
@@ -486,17 +520,70 @@ pub const Shaper = struct {
                     // exceptions to this heuristic for detecting ligatures,
                     // but using the logging below seems to show it works
                     // well.)
-                    if (is_first_codepoint_in_cluster and
-                        !is_after_glyph_from_current_or_next_clusters)
-                    {
-                        cell_offset = .{
-                            .cluster = cluster,
-                            .x = run_offset.x,
+                    if (is_first_codepoint_in_cluster) {
+                        const should_reset = (run.rtl and !is_combining_mark) or
+                            !is_after_glyph_from_current_or_next_clusters;
+                        if (should_reset) {
+                            // For RTL runs, CoreText's absolute glyph position
+                            // is the reliable cell anchor. The cumulative
+                            // advance is in output order and can point at the
+                            // wrong cell when marks are emitted around a base.
+                            const reset_x = if (run.rtl) position.x else run_offset.x;
+                            cell_offset = .{
+                                .cluster = cluster,
+                                .x = reset_x,
+                            };
+                            if (self.anchor(cluster)) |a| a.* = reset_x;
+                        }
+                    } else if (!run.rtl and !is_combining_mark) {
+                        // In LTR scripts, a cluster's first codepoint can be
+                        // absent from the glyph stream (due to ligature
+                        // composition). If this is the first glyph we see for
+                        // that cluster, establish an anchor now.
+                        if (self.anchor(cluster)) |a| if (std.math.isNan(a.*)) {
+                            cell_offset = .{
+                                .cluster = cluster,
+                                .x = run_offset.x,
+                            };
+                            a.* = run_offset.x;
                         };
-
-                        // For debugging positions, turn this on:
-                        //cell_offset_y = run_offset_y;
+                    } else if (run.rtl and is_combining_mark) {
+                        if (self.anchor(cluster)) |a| {
+                            const anchor_x = a.*;
+                            // Keep this scoped to Arabic RTL marks only. Other
+                            // scripts can also emit marks out of logical order,
+                            // but they do not all want the Arabic "attach back
+                            // to base cell" fallback.
+                            const allow_non_first_fallback =
+                                bidi_helpers.isArabicCombiningMark(source_codepoint);
+                            if (!std.math.isNan(anchor_x)) {
+                                cell_offset = .{
+                                    .cluster = cluster,
+                                    .x = anchor_x,
+                                };
+                            } else if (allow_non_first_fallback) {
+                                // A non-first combining mark can still be
+                                // emitted before its base glyph in visual
+                                // stream order. If we don't have a prior
+                                // anchor yet, establish one at the current
+                                // run offset.
+                                cell_offset = .{
+                                    .cluster = cluster,
+                                    .x = position.x,
+                                };
+                                a.* = position.x;
+                            }
+                        }
                     }
+                } else if (run.rtl and source_codepoint != 0 and !is_combining_mark and
+                    isFirstInCluster(state.codepoints.items, index))
+                {
+                    // In RTL runs, a combining mark can establish a cluster
+                    // anchor before the base glyph arrives. Re-anchor to the
+                    // base glyph position once the first logical codepoint in
+                    // the cluster is seen.
+                    cell_offset.x = position.x;
+                    if (self.anchor(cluster)) |a| a.* = position.x;
                 }
 
                 // For debugging positions, turn this on:
@@ -510,6 +597,10 @@ pub const Shaper = struct {
                     .y_offset = @intFromFloat(@round(position.y)),
                     .glyph_index = glyph,
                 });
+                if (run.rtl) try sources.append(alloc, .{
+                    .index = index,
+                    .advance = advance.width,
+                });
 
                 // Add our advances to keep track of our run offsets.
                 // Advances apply to the NEXT cell.
@@ -521,12 +612,12 @@ pub const Shaper = struct {
             }
         }
 
-        // If our buffer contains some non-ltr sections we need to sort it :/
-        if (non_ltr) {
-            // This is EXCEPTIONALLY rare. Only happens for languages with
-            // complex shaping which we don't even really support properly
-            // right now, so are very unlikely to be used heavily by users
-            // of Ghostty.
+        if (run.rtl) try self.placeRtlGlyphs(alloc, run, sources.items);
+
+        // CoreText may return RTL or otherwise non-monotonic glyph runs. The
+        // renderer expects cells sorted by increasing terminal x, so normalize
+        // the order after all per-glyph offsets have been computed.
+        if (non_ltr or run.rtl) {
             @branchHint(.cold);
             std.mem.sort(
                 font.shape.Cell,
@@ -541,6 +632,114 @@ pub const Shaper = struct {
         }
 
         return self.cell_buf.items;
+    }
+
+    /// The x anchor of a cluster, or null if the cluster is not in the run.
+    fn anchor(self: *Shaper, cluster: u32) ?*f64 {
+        const anchors = self.cluster_anchor_x.items;
+        return if (cluster < anchors.len) &anchors[cluster] else null;
+    }
+
+    const GlyphSource = struct {
+        /// The index in the shaped string of the glyph's first codepoint.
+        index: usize,
+        advance: f64,
+    };
+
+    /// Align each glyph to the right edge of its cell. RTL text starts on
+    /// the right, so a glyph wider than its cell goes left, under the
+    /// letter that it joins, and not into the next cell or the cursor.
+    ///
+    /// A ligature such as lam-alef covers two or more cells, but its
+    /// glyph is narrower, so it leaves an empty cell. Center each ligature
+    /// on its cells. If the letter on its right joins to it, fill the gap
+    /// on that side with tatweel glyphs, so the word stays connected.
+    fn placeRtlGlyphs(
+        self: *Shaper,
+        alloc: Allocator,
+        run: font.shape.TextRun,
+        sources: []const GlyphSource,
+    ) !void {
+        const codepoints = self.run_state.codepoints.items;
+        const cell_width: f64 = @floatFromInt(run.grid.metrics.cell_width);
+
+        // A base glyph covers its codepoints up to the next base glyph.
+        const starts = try alloc.alloc(bool, codepoints.len);
+        @memset(starts, false);
+        for (sources) |source| {
+            if (!isMark(codepoints[source.index].codepoint)) starts[source.index] = true;
+        }
+        const done = try alloc.alloc(bool, codepoints.len);
+        @memset(done, false);
+
+        // Looked up on the first ligature that needs it.
+        var tatweel: ?(?Tatweel) = null;
+
+        for (sources, 0..) |source, g| {
+            // CoreText can split one base into several glyphs; place it once.
+            if (!starts[source.index] or done[source.index]) continue;
+            done[source.index] = true;
+
+            // The cells of the base letters, not marks, that the glyph covers.
+            var min: u32 = std.math.maxInt(u32);
+            var max: u32 = 0;
+            for (codepoints[source.index..], source.index..) |cp, i| {
+                if (i > source.index and starts[i]) break;
+                if (cp.codepoint == 0 or isMark(cp.codepoint)) continue;
+                min = @min(min, cp.cluster);
+                max = @max(max, cp.cluster);
+            }
+            if (min > max) continue;
+
+            // Move the glyph, and the marks drawn on its cells, to the
+            // right edge of one cell or the center of a ligature's cells.
+            const span: f64 = @floatFromInt(max - min + 1);
+            const space = span * cell_width - source.advance;
+            const left = @as(f64, @floatFromInt(min)) * cell_width +
+                if (min == max) space else space / 2;
+            const ligature = self.cell_buf.items[g];
+            const now = @as(f64, @floatFromInt(ligature.x)) * cell_width +
+                @as(f64, @floatFromInt(ligature.x_offset));
+            const delta: i16 = @intFromFloat(@round(left - now));
+            for (self.cell_buf.items[0..sources.len]) |*cell| {
+                if (cell.x >= min and cell.x <= max) cell.x_offset += delta;
+            }
+
+            if (min == max or !joinsRight(codepoints, source.index)) continue;
+            if (tatweel == null) tatweel = try tatweelGlyph(run);
+            const fill = tatweel.? orelse continue;
+
+            // Fill from the right edge of the cells back to the glyph.
+            const max_x = @as(f64, @floatFromInt(max)) * cell_width;
+            var x = max_x + cell_width - fill.width;
+            while (x + fill.width > left + source.advance) : (x -= fill.width) {
+                try self.cell_buf.append(self.alloc, .{
+                    .x = @intCast(max),
+                    .x_offset = @intFromFloat(@round(x - max_x)),
+                    .y_offset = ligature.y_offset,
+                    .glyph_index = fill.glyph,
+                });
+            }
+        }
+    }
+
+    const Tatweel = struct { glyph: u32, width: f64 };
+
+    /// The tatweel glyph of the run's font, or null if the font has none
+    /// or it is narrower than a pixel.
+    fn tatweelGlyph(run: font.shape.TextRun) !?Tatweel {
+        run.grid.lock.lockSharedUncancelable(global.io());
+        defer run.grid.lock.unlockShared(global.io());
+
+        const face = try run.grid.resolver.collection.getFace(run.font_index);
+        const glyph = face.glyphIndex(0x0640) orelse return null;
+        const width = face.font.getAdvancesForGlyphs(
+            .horizontal,
+            &.{@intCast(glyph)},
+            null,
+        );
+        if (width < 1) return null;
+        return .{ .glyph = glyph, .width = width };
     }
 
     /// Get an attr dict for a font from a specific index.
@@ -684,6 +883,10 @@ pub const Shaper = struct {
 
         pub fn finalize(self: RunIteratorHook) void {
             _ = self;
+        }
+
+        pub fn bidiLayoutScratch(self: RunIteratorHook) *itijah.VisualLayoutScratch {
+            return &self.shaper.bidi_layout_scratch;
         }
     };
 
@@ -834,6 +1037,45 @@ pub const Shaper = struct {
         }
     }
 };
+
+/// True if no codepoint before `index` is in the same cluster.
+fn isFirstInCluster(codepoints: []const Shaper.Codepoint, index: usize) bool {
+    const cluster = codepoints[index].cluster;
+    var i = index;
+    while (i > 0) {
+        i -= 1;
+        // Skip surrogate pair padding
+        if (codepoints[i].codepoint == 0) continue;
+        return codepoints[i].cluster != cluster;
+    }
+    return true;
+}
+
+fn isMark(cp: u32) bool {
+    return unicode.table.get(@intCast(cp)).width_zero_in_grapheme;
+}
+
+/// True if the codepoint at `index` joins the letter before it in logical
+/// order, which is the letter on its right in RTL text.
+fn joinsRight(codepoints: []const Shaper.Codepoint, index: usize) bool {
+    const joins = itijah.unicode.joiningType;
+    switch (joins(@intCast(codepoints[index].codepoint))) {
+        .dual_joining, .right_joining, .join_causing => {},
+        else => return false,
+    }
+    var i = index;
+    while (i > 0) {
+        i -= 1;
+        const cp = codepoints[i].codepoint;
+        if (cp == 0) continue;
+        return switch (joins(@intCast(cp))) {
+            .dual_joining, .left_joining, .join_causing => true,
+            .transparent => continue,
+            else => false,
+        };
+    }
+    return false;
+}
 
 test "run iterator" {
     const testing = std.testing;
@@ -1823,13 +2065,8 @@ test "shape Chakma vowel sign with ligature (vowel sign renders first)" {
         const cells = try shaper.shape(run);
         try testing.expectEqual(@as(usize, 4), cells.len);
         try testing.expectEqual(@as(u16, 0), cells[0].x);
-        // See the giant "We need to reset the `cell_offset`" comment, but here
-        // we should technically have the rest of these be `x` of 1, but that
-        // would require going back in the stream to adjust past cells, and
-        // we don't take on that complexity.
-        try testing.expectEqual(@as(u16, 0), cells[1].x);
-        try testing.expectEqual(@as(u16, 0), cells[2].x);
-        try testing.expectEqual(@as(u16, 0), cells[3].x);
+        for (cells) |cell| try testing.expect(cell.x < run.cells);
+        for (cells[1..], 0..) |cell, i| try testing.expect(cell.x >= cells[i].x);
 
         // The vowel sign U renders before the TAA:
         try testing.expect(cells[1].x_offset < cells[2].x_offset);
@@ -1893,23 +2130,143 @@ test "shape Bengali ligatures with out of order vowels" {
 
         const cells = try shaper.shape(run);
         try testing.expectEqual(@as(usize, 8), cells.len);
-        try testing.expectEqual(@as(u16, 0), cells[0].x);
-        try testing.expectEqual(@as(u16, 0), cells[1].x);
-        // See the giant "We need to reset the `cell_offset`" comment, but here
-        // we should technically have the rest of these be `x` of 2, but that
-        // would require going back in the stream to adjust past cells, and
-        // we don't take on that complexity.
-        try testing.expectEqual(@as(u16, 0), cells[2].x);
-        try testing.expectEqual(@as(u16, 0), cells[3].x);
-        try testing.expectEqual(@as(u16, 0), cells[4].x);
-        try testing.expectEqual(@as(u16, 0), cells[5].x);
-        try testing.expectEqual(@as(u16, 0), cells[6].x);
-        try testing.expectEqual(@as(u16, 0), cells[7].x);
+        for (cells) |cell| try testing.expect(cell.x < run.cells);
+        for (cells[1..], 0..) |cell, i| try testing.expect(cell.x >= cells[i].x);
+
+        var distinct: usize = 1;
+        var prev_x = cells[0].x;
+        for (cells[1..]) |cell| {
+            if (cell.x != prev_x) {
+                distinct += 1;
+                prev_x = cell.x;
+            }
+        }
+        try testing.expect(distinct >= 2);
 
         // The vowel sign E renders before the SSA:
         try testing.expect(cells[2].x_offset < cells[3].x_offset);
     }
     try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "shape Bengali sentence keeps base clusters anchored" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = testShaperWithDiscoveredFont(
+        alloc,
+        "Arial Unicode MS",
+    ) catch return error.SkipZigTest;
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 200, .rows = 3 });
+    defer t.deinit(alloc);
+
+    t.modes.set(.grapheme_cluster, true);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("পছন্দের ভাষা টাইপ করা আরো সহজ করে তোলে৷ আরো জানুন");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    var saw_run = false;
+    while (try it.next(alloc)) |run| {
+        saw_run = true;
+
+        var expected = try alloc.alloc(bool, run.cells);
+        defer alloc.free(expected);
+        @memset(expected, false);
+
+        for (shaper.run_state.codepoints.items) |entry| {
+            if (entry.codepoint == 0) continue;
+            if (unicode.table.get(@intCast(entry.codepoint)).width_zero_in_grapheme) continue;
+            const cluster_i: usize = @intCast(entry.cluster);
+            if (cluster_i < expected.len) expected[cluster_i] = true;
+        }
+
+        const cells = try shaper.shape(run);
+        var actual = try alloc.alloc(bool, run.cells);
+        defer alloc.free(actual);
+        @memset(actual, false);
+
+        for (cells) |cell| {
+            if (cell.x < actual.len) actual[cell.x] = true;
+        }
+        for (expected, 0..) |need, i| {
+            if (need) try testing.expect(actual[i]);
+        }
+    }
+    try testing.expect(saw_run);
+}
+
+test "shape Bengali sentence in mixed-direction line keeps base clusters anchored" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = testShaperWithDiscoveredFont(
+        alloc,
+        "Arial Unicode MS",
+    ) catch return error.SkipZigTest;
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 220, .rows = 3 });
+    defer t.deinit(alloc);
+
+    t.modes.set(.grapheme_cluster, true);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("ABC পছন্দের ভাষা টাইপ করা আরো সহজ করে তোলে৷ আরো জানুন مرحبا");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    var saw_bengali = false;
+    while (try it.next(alloc)) |run| {
+        var expected = try alloc.alloc(bool, run.cells);
+        defer alloc.free(expected);
+        @memset(expected, false);
+
+        var has_bengali = false;
+        for (shaper.run_state.codepoints.items) |entry| {
+            if (entry.codepoint == 0) continue;
+            if (entry.codepoint >= 0x0980 and entry.codepoint <= 0x09FF) has_bengali = true;
+            if (unicode.table.get(@intCast(entry.codepoint)).width_zero_in_grapheme) continue;
+            const cluster_i: usize = @intCast(entry.cluster);
+            if (cluster_i < expected.len) expected[cluster_i] = true;
+        }
+        if (!has_bengali) continue;
+        saw_bengali = true;
+
+        const cells = try shaper.shape(run);
+        var actual = try alloc.alloc(bool, run.cells);
+        defer alloc.free(actual);
+        @memset(actual, false);
+
+        for (cells) |cell| {
+            if (cell.x < actual.len) actual[cell.x] = true;
+        }
+        for (expected, 0..) |need, i| {
+            if (need) try testing.expect(actual[i]);
+        }
+    }
+    try testing.expect(saw_bengali);
 }
 
 test "shape box glyphs" {
@@ -2516,6 +2873,690 @@ test "shape high plane sprite font codepoint" {
     try testing.expectEqual(null, try it.next(alloc));
 }
 
+test "shape LTR neutral RTL splits and sets direction" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    // "Hello مرحبا" — LTR "Hello" then neutral space then RTL Arabic.
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("Hello مرحبا");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    var runs: [10]font.shape.TextRun = undefined;
+    var count: usize = 0;
+    while (try it.next(alloc)) |run| {
+        if (count < runs.len) runs[count] = run;
+        count += 1;
+    }
+
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expect(!runs[0].rtl);
+    try testing.expectEqual(@as(u16, 0), runs[0].offset);
+    try testing.expect(runs[1].rtl);
+    try testing.expect(runs[1].offset > 0);
+}
+
+test "run iterator column maps for RTL with a wide cell" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .julia_mono);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // Logical columns: א=0 ב=1 😀=2 (spacer tail=3) ג=4 ד=5.
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("אב😀גד");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var it = testdata.shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    const row = try it.layout(alloc);
+
+    // The row is reversed, but the wide cell stays left of its spacer.
+    const expected = [_]usize{ 5, 4, 2, 3, 1, 0 };
+    for (expected, 0..) |l, x| {
+        try testing.expectEqual(l, row.logicalColumn(x));
+        try testing.expectEqual(x, row.visualColumn(l));
+    }
+
+    // Empty cells after the text keep their column.
+    try testing.expectEqual(@as(usize, 8), row.logicalColumn(8));
+}
+
+test "run iterator keeps an RTL word in one run across selection and cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("مرحبا");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // A split inside the word would break the joining of its letters.
+    var it = testdata.shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+        .selection = .{ 1, 2 },
+        .cursor_x = 3,
+    });
+    const run = (try it.next(alloc)).?;
+    try testing.expect(run.rtl);
+    try testing.expectEqual(@as(u16, 5), run.cells);
+    try testing.expect(try it.next(alloc) == null);
+}
+
+test "run iterator splits an RTL run at an invisible cell" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("مر\x1b[8mح\x1b[0mبا");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // The invisible cell draws no glyph, so it is in no run.
+    var it = testdata.shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    var cells: u16 = 0;
+    while (try it.next(alloc)) |run| cells += run.cells;
+    try testing.expectEqual(@as(u16, 4), cells);
+}
+
+test "joinsRight checks the letter before a ligature" {
+    const testing = std.testing;
+    const cps = struct {
+        fn of(comptime s: []const u21) [s.len]Shaper.Codepoint {
+            var out: [s.len]Shaper.Codepoint = undefined;
+            for (s, &out) |cp, *o| o.* = .{ .codepoint = cp, .cluster = 0 };
+            return out;
+        }
+    }.of;
+
+    // سلام: seen joins lam.
+    try testing.expect(joinsRight(&cps(&.{ 'س', 'ل', 'ا', 'م' }), 1));
+    // دولار: waw never joins the next letter.
+    try testing.expect(!joinsRight(&cps(&.{ 'د', 'و', 'ل', 'ا', 'ر' }), 2));
+    // لا at the start of a word has nothing to join.
+    try testing.expect(!joinsRight(&cps(&.{ 'ل', 'ا' }), 0));
+    // A mark between the letters does not break the join: سَلا.
+    try testing.expect(joinsRight(&cps(&.{ 'س', 0x064E, 'ل', 'ا' }), 2));
+}
+
+test "shape centers lam-alef and fills a joined side with tatweel" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+    const cell_width: i16 = @intCast(testdata.grid.metrics.cell_width);
+
+    const Case = struct { text: []const u8, ligature_x: u16, tatweels: usize };
+    for ([_]Case{
+        // Seen joins lam, so a tatweel fills the right side.
+        .{ .text = "سلام", .ligature_x = 2, .tatweels = 1 },
+        // Waw never joins the next letter, so the gap stays.
+        .{ .text = "دولار", .ligature_x = 2, .tatweels = 0 },
+    }) |case| {
+        var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+        defer t.deinit(alloc);
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(case.text);
+
+        var state: terminal.RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &t);
+
+        var it = testdata.shaper.runIterator(.{
+            .grid = testdata.grid,
+            .cells = state.row_data.get(0).cells.slice(),
+        });
+        const run = (try it.next(alloc)).?;
+        const face = try testdata.grid.resolver.collection.getFace(run.font_index);
+        const tatweel = face.glyphIndex(0x0640).?;
+
+        // The lam-alef glyph sits in the lam cell, moved half a cell left
+        // to the center of the lam and alef cells.
+        var tatweels: usize = 0;
+        var centered = false;
+        for (try testdata.shaper.shape(run)) |cell| {
+            if (cell.glyph_index == tatweel) {
+                tatweels += 1;
+            } else if (cell.x == case.ligature_x) {
+                centered = cell.x_offset == -@divTrunc(cell_width, 2);
+            }
+        }
+        try testing.expect(centered);
+        try testing.expectEqual(case.tatweels, tatweels);
+    }
+}
+
+test "shape keeps only the necessary RTL ligatures" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Courier New has an Allah ligature in its standard ligatures.
+    var testdata = try testShaperWithDiscoveredFont(alloc, "Courier New");
+    defer testdata.deinit();
+
+    const Case = struct { text: []const u8, glyphs: usize };
+    for ([_]Case{
+        // Allah stays four letters, one in each cell.
+        .{ .text = "الله", .glyphs = 4 },
+        // Lam-alef is a necessary ligature.
+        .{ .text = "لا", .glyphs = 1 },
+    }) |case| {
+        var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+        defer t.deinit(alloc);
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(case.text);
+
+        var state: terminal.RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &t);
+
+        var it = testdata.shaper.runIterator(.{
+            .grid = testdata.grid,
+            .cells = state.row_data.get(0).cells.slice(),
+        });
+        const run = (try it.next(alloc)).?;
+        try testing.expectEqual(case.glyphs, (try testdata.shaper.shape(run)).len);
+    }
+}
+
+test "shape aligns RTL letters to the right edge of their cells" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Geeza Pro is proportional, so its letters are not one cell wide.
+    var testdata = try testShaperWithDiscoveredFont(alloc, "Geeza Pro");
+    defer testdata.deinit();
+    const cell_width: f64 = @floatFromInt(testdata.grid.metrics.cell_width);
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("بسم");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var it = testdata.shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    const run = (try it.next(alloc)).?;
+    const face = try testdata.grid.resolver.collection.getFace(run.font_index);
+
+    // The right edge of the last letter must not go into the next cell,
+    // where the cursor is.
+    const cells = try testdata.shaper.shape(run);
+    try testing.expectEqual(3, cells.len);
+    for (cells) |cell| {
+        const advance = face.font.getAdvancesForGlyphs(
+            .horizontal,
+            &.{@intCast(cell.glyph_index)},
+            null,
+        );
+        const right = @as(f64, @floatFromInt(cell.x)) * cell_width +
+            @as(f64, @floatFromInt(cell.x_offset)) + advance;
+        try testing.expectApproxEqAbs((@as(f64, @floatFromInt(cell.x)) + 1) * cell_width, right, 1);
+    }
+}
+
+test "shape hebrew RTL" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .julia_mono);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("שלום עולם");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    var count: usize = 0;
+    while (try it.next(alloc)) |run| {
+        count += 1;
+        try testing.expect(run.rtl);
+        try testing.expectEqual(@as(u16, 9), run.cells);
+
+        const cells = try shaper.shape(run);
+        try testing.expect(cells.len > 1);
+
+        var x: u16 = cells[0].x;
+        try testing.expect(x < run.cells);
+        for (cells[1..]) |cell| {
+            try testing.expect(cell.x < run.cells);
+            try testing.expect(cell.x >= x);
+            x = cell.x;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "shape arabic with tashkeel at EOL" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("مرحباً");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    const run = (try it.next(alloc)).?;
+    try testing.expect(run.rtl);
+    try testing.expectEqual(@as(u16, 5), run.cells);
+    const cells = try shaper.shape(run);
+    try testing.expect(cells.len > 1);
+
+    var prev_x: u16 = cells[0].x;
+    for (cells[1..]) |cell| {
+        try testing.expect(cell.x >= prev_x);
+        prev_x = cell.x;
+    }
+    for (cells) |cell| {
+        try testing.expect(cell.x < run.cells);
+    }
+
+    try testing.expectEqual(try it.next(alloc), null);
+}
+
+test "shape arabic with tashkeel on middle letters" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("وفُكَّ");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    const run = (try it.next(alloc)).?;
+    try testing.expect(run.rtl);
+    try testing.expectEqual(@as(u16, 3), run.cells);
+
+    const cells = try shaper.shape(run);
+    try testing.expect(cells.len > 0);
+
+    var seen = [_]bool{ false, false, false };
+    for (cells) |cell| {
+        try testing.expect(cell.x < run.cells);
+        seen[cell.x] = true;
+    }
+    try testing.expect(seen[0]);
+    try testing.expect(seen[1]);
+    try testing.expect(seen[2]);
+
+    try testing.expectEqual(@as(?font.shape.TextRun, null), try it.next(alloc));
+}
+
+test "shape arabic tanween stays on hamza before space" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("شيءٍ جميل");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    const run = (try it.next(alloc)).?;
+    try testing.expect(run.rtl);
+    try testing.expectEqual(@as(u16, 8), run.cells);
+
+    var hamza_cluster: ?u32 = null;
+    var tanween_cluster: ?u32 = null;
+    for (shaper.run_state.codepoints.items) |entry| {
+        if (entry.codepoint == 0x0621 and hamza_cluster == null) hamza_cluster = entry.cluster;
+        if (entry.codepoint == 0x064D and tanween_cluster == null) tanween_cluster = entry.cluster;
+    }
+    try testing.expect(hamza_cluster != null);
+    try testing.expect(tanween_cluster != null);
+    try testing.expectEqual(hamza_cluster.?, tanween_cluster.?);
+
+    const cells = try shaper.shape(run);
+    try testing.expect(cells.len > 0);
+
+    var hamza_cell_glyphs: usize = 0;
+    for (cells) |cell| {
+        if (cell.x == hamza_cluster.?) hamza_cell_glyphs += 1;
+    }
+    try testing.expect(hamza_cell_glyphs >= 2);
+
+    try testing.expectEqual(@as(?font.shape.TextRun, null), try it.next(alloc));
+}
+
+test "shape arabic end tashkeel no overlap" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("بحقِّ");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    const run = (try it.next(alloc)).?;
+    try testing.expect(run.rtl);
+    try testing.expectEqual(@as(u16, 3), run.cells);
+
+    var qaf_cluster: ?u32 = null;
+    var kasra_cluster: ?u32 = null;
+    var shadda_cluster: ?u32 = null;
+    var ha_cluster: ?u32 = null;
+    for (shaper.run_state.codepoints.items) |entry| {
+        if (entry.codepoint == 0) continue;
+        if (entry.codepoint == 0x0642 and qaf_cluster == null) qaf_cluster = entry.cluster;
+        if (entry.codepoint == 0x0650 and kasra_cluster == null) kasra_cluster = entry.cluster;
+        if (entry.codepoint == 0x0651 and shadda_cluster == null) shadda_cluster = entry.cluster;
+        if (entry.codepoint == 0x062D and ha_cluster == null) ha_cluster = entry.cluster;
+    }
+    try testing.expect(qaf_cluster != null);
+    try testing.expect(kasra_cluster != null);
+    try testing.expect(shadda_cluster != null);
+    try testing.expect(ha_cluster != null);
+    try testing.expectEqual(qaf_cluster.?, kasra_cluster.?);
+    try testing.expectEqual(qaf_cluster.?, shadda_cluster.?);
+    try testing.expect(qaf_cluster.? != ha_cluster.?);
+
+    const cells = try shaper.shape(run);
+    try testing.expect(cells.len > 0);
+
+    var prev_x: u16 = cells[0].x;
+    for (cells[1..]) |cell| {
+        try testing.expect(cell.x >= prev_x);
+        prev_x = cell.x;
+    }
+
+    var seen = [_]bool{ false, false, false };
+    var qaf_cell_glyphs: usize = 0;
+    for (cells) |cell| {
+        try testing.expect(cell.x < run.cells);
+        seen[cell.x] = true;
+        if (cell.x == qaf_cluster.?) qaf_cell_glyphs += 1;
+
+        // Base glyphs after the tashkeel cluster must not carry a
+        // spurious x_offset from position.x/run_offset.x divergence.
+        if (cell.x != qaf_cluster.?) {
+            try testing.expectEqual(@as(i32, 0), cell.x_offset);
+        }
+    }
+    try testing.expect(seen[0]);
+    try testing.expect(seen[1]);
+    try testing.expect(seen[2]);
+    try testing.expect(qaf_cell_glyphs >= 2);
+
+    try testing.expectEqual(@as(?font.shape.TextRun, null), try it.next(alloc));
+}
+
+test "shape arabic end tanween no overlap" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("عينٍ");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    const run = (try it.next(alloc)).?;
+    try testing.expect(run.rtl);
+    try testing.expectEqual(@as(u16, 3), run.cells);
+
+    var nun_cluster: ?u32 = null;
+    var tanween_cluster: ?u32 = null;
+    var ya_cluster: ?u32 = null;
+    for (shaper.run_state.codepoints.items) |entry| {
+        if (entry.codepoint == 0) continue;
+        if (entry.codepoint == 0x0646 and nun_cluster == null) nun_cluster = entry.cluster;
+        if (entry.codepoint == 0x064D and tanween_cluster == null) tanween_cluster = entry.cluster;
+        if (entry.codepoint == 0x064A and ya_cluster == null) ya_cluster = entry.cluster;
+    }
+    try testing.expect(nun_cluster != null);
+    try testing.expect(tanween_cluster != null);
+    try testing.expect(ya_cluster != null);
+    try testing.expectEqual(nun_cluster.?, tanween_cluster.?);
+    try testing.expect(nun_cluster.? != ya_cluster.?);
+
+    const cells = try shaper.shape(run);
+    try testing.expect(cells.len > 0);
+
+    var prev_x: u16 = cells[0].x;
+    for (cells[1..]) |cell| {
+        try testing.expect(cell.x >= prev_x);
+        prev_x = cell.x;
+    }
+
+    var seen = [_]bool{ false, false, false };
+    var nun_cell_glyphs: usize = 0;
+    for (cells) |cell| {
+        try testing.expect(cell.x < run.cells);
+        seen[cell.x] = true;
+        if (cell.x == nun_cluster.?) nun_cell_glyphs += 1;
+
+        // Base glyphs after the tanween cluster must not carry a
+        // spurious x_offset from position.x/run_offset.x divergence.
+        if (cell.x != nun_cluster.?) {
+            try testing.expectEqual(@as(i32, 0), cell.x_offset);
+        }
+    }
+    try testing.expect(seen[0]);
+    try testing.expect(seen[1]);
+    try testing.expect(seen[2]);
+    try testing.expect(nun_cell_glyphs >= 2);
+
+    try testing.expectEqual(@as(?font.shape.TextRun, null), try it.next(alloc));
+}
+
+test "shape arabic multiword end tashkeel stays anchored" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("الحيِّ الذي");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    const run = (try it.next(alloc)).?;
+    try testing.expect(run.rtl);
+
+    var kasra_cluster: ?u32 = null;
+    var shadda_cluster: ?u32 = null;
+    for (shaper.run_state.codepoints.items) |entry| {
+        if (entry.codepoint == 0) continue;
+        if (entry.codepoint == 0x0650 and kasra_cluster == null) kasra_cluster = entry.cluster;
+        if (entry.codepoint == 0x0651 and shadda_cluster == null) shadda_cluster = entry.cluster;
+    }
+    try testing.expect(kasra_cluster != null);
+    try testing.expect(shadda_cluster != null);
+    try testing.expectEqual(kasra_cluster.?, shadda_cluster.?);
+    const ya_cluster = kasra_cluster.?;
+
+    var ha_cluster: ?u32 = null;
+    for (shaper.run_state.codepoints.items) |entry| {
+        if (entry.codepoint == 0) continue;
+        if (entry.codepoint == 0x062D and ha_cluster == null) ha_cluster = entry.cluster;
+    }
+    try testing.expect(ha_cluster != null);
+    try testing.expect(ha_cluster.? != ya_cluster);
+
+    const cells = try shaper.shape(run);
+    try testing.expect(cells.len > 0);
+
+    var prev_x: u16 = cells[0].x;
+    var saw_ha = false;
+    var saw_ya = false;
+    var ya_base_near_zero = false;
+    for (cells) |cell| {
+        try testing.expect(cell.x < run.cells);
+        try testing.expect(cell.x >= prev_x);
+        prev_x = cell.x;
+
+        const xoff: i32 = cell.x_offset;
+        try testing.expect(@abs(xoff) < 200);
+        if (cell.x == ha_cluster.?) saw_ha = true;
+        if (cell.x == ya_cluster) {
+            saw_ya = true;
+            if (@abs(xoff) <= 5 and @abs(@as(i32, cell.y_offset)) <= 5) {
+                ya_base_near_zero = true;
+            }
+        }
+    }
+    try testing.expect(saw_ha);
+    try testing.expect(saw_ya);
+    try testing.expect(ya_base_near_zero);
+
+    try testing.expectEqual(@as(?font.shape.TextRun, null), try it.next(alloc));
+}
+
 const TestShaper = struct {
     alloc: Allocator,
     shaper: Shaper,
@@ -2531,10 +3572,12 @@ const TestShaper = struct {
 };
 
 const TestFont = enum {
+    arabic,
     code_new_roman,
     geist_mono,
     inconsolata,
     jetbrains_mono,
+    julia_mono,
     monaspace_neon,
     nerd_font,
 };
@@ -2548,10 +3591,12 @@ fn testShaperWithFont(alloc: Allocator, font_req: TestFont) !TestShaper {
     const testEmoji = font.embedded.emoji;
     const testEmojiText = font.embedded.emoji_text;
     const testFont = switch (font_req) {
+        .arabic => font.embedded.arabic,
         .code_new_roman => font.embedded.code_new_roman,
         .inconsolata => font.embedded.inconsolata,
         .geist_mono => font.embedded.geist_mono,
         .jetbrains_mono => font.embedded.jetbrains_mono,
+        .julia_mono => font.embedded.julia_mono,
         .monaspace_neon => font.embedded.monaspace_neon,
         .nerd_font => font.embedded.test_nerd_font,
     };

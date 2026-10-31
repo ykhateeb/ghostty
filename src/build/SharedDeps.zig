@@ -538,6 +538,17 @@ pub fn add(
     })) |dep| {
         step.root_module.addImport("z2d", dep.module("z2d"));
     }
+    // Bidi layout for RTL shaping. Vendored because the upstream
+    // build.zig does not compile with our Zig version.
+    {
+        const itijah = b.createModule(.{
+            .root_source_file = b.path("vendor/itijah/src/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        itijah.addImport("uucode", self.uucode_mod);
+        step.root_module.addImport("itijah", itijah);
+    }
     if (b.lazyDependency("zf", .{
         .target = target,
         .optimize = optimize,
