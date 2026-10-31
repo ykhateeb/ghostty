@@ -470,8 +470,7 @@ pub const Shaper = struct {
                 // left-to-right through the terminal row.
                 const cluster = state.codepoints.items[index].cluster;
                 const source_codepoint = state.codepoints.items[index].codepoint;
-                const is_combining_mark = source_codepoint != 0 and
-                    unicode.table.get(@intCast(source_codepoint)).width_zero_in_grapheme;
+                const is_combining_mark = source_codepoint != 0 and isMark(source_codepoint);
                 if (cell_offset.cluster != cluster) {
                     // We previously asserted that the new cluster is greater
                     // than cell_offset.cluster, but this isn't always true.
@@ -636,7 +635,7 @@ pub const Shaper = struct {
             }
         }
 
-        if (run.rtl) try self.spreadLigatures(run, sources.items);
+        if (run.rtl) try self.spreadLigatures(alloc, run, sources.items);
 
         // CoreText may return RTL or otherwise non-monotonic glyph runs. The
         // renderer expects cells sorted by increasing terminal x, so normalize
@@ -670,29 +669,40 @@ pub const Shaper = struct {
     /// on that side with tatweel glyphs, so the word stays connected.
     fn spreadLigatures(
         self: *Shaper,
+        alloc: Allocator,
         run: font.shape.TextRun,
         sources: []const GlyphSource,
     ) !void {
         const codepoints = self.run_state.codepoints.items;
         const cell_width: f64 = @floatFromInt(run.grid.metrics.cell_width);
-        for (sources, 0..) |source, g| {
-            const first = codepoints[source.index];
-            if (first.codepoint == 0 or isMark(first.codepoint)) continue;
 
-            // The glyph covers its codepoints up to the next base glyph.
-            var end = codepoints.len;
-            for (sources) |other| {
-                if (other.index > source.index and
-                    !isMark(codepoints[other.index].codepoint)) end = @min(end, other.index);
-            }
-            var min = first.cluster;
-            var max = first.cluster;
-            for (codepoints[source.index..end]) |cp| {
-                if (cp.codepoint == 0) continue;
+        // A base glyph covers its codepoints up to the next base glyph.
+        const starts = try alloc.alloc(bool, codepoints.len);
+        @memset(starts, false);
+        for (sources) |source| {
+            if (!isMark(codepoints[source.index].codepoint)) starts[source.index] = true;
+        }
+        const done = try alloc.alloc(bool, codepoints.len);
+        @memset(done, false);
+
+        // Looked up on the first ligature that needs it.
+        var tatweel: ?(?Tatweel) = null;
+
+        for (sources, 0..) |source, g| {
+            // CoreText can split one base into several glyphs; place it once.
+            if (!starts[source.index] or done[source.index]) continue;
+            done[source.index] = true;
+
+            // The cells of the base letters, not marks, that the glyph covers.
+            var min: u32 = std.math.maxInt(u32);
+            var max: u32 = 0;
+            for (codepoints[source.index..], source.index..) |cp, i| {
+                if (i > source.index and starts[i]) break;
+                if (cp.codepoint == 0 or isMark(cp.codepoint)) continue;
                 min = @min(min, cp.cluster);
                 max = @max(max, cp.cluster);
             }
-            if (min == max) continue;
+            if (min >= max) continue;
 
             // Move the glyph, and the marks drawn on its cells, to the center.
             const span: f64 = @floatFromInt(max - min + 1);
@@ -707,27 +717,40 @@ pub const Shaper = struct {
             }
 
             if (!joinsRight(codepoints, source.index)) continue;
-            const face = try run.grid.resolver.collection.getFace(run.font_index);
-            const tatweel = face.glyphIndex(0x0640) orelse continue;
-            const width = face.font.getAdvancesForGlyphs(
-                .horizontal,
-                &.{@intCast(tatweel)},
-                null,
-            );
-            if (width <= 0) continue;
+            if (tatweel == null) tatweel = try tatweelGlyph(run);
+            const fill = tatweel.? orelse continue;
 
             // Fill from the right edge of the cells back to the glyph.
             const max_x = @as(f64, @floatFromInt(max)) * cell_width;
-            var x = max_x + cell_width - width;
-            while (x + width > left + source.advance) : (x -= width) {
+            var x = max_x + cell_width - fill.width;
+            while (x + fill.width > left + source.advance) : (x -= fill.width) {
                 try self.cell_buf.append(self.alloc, .{
                     .x = @intCast(max),
                     .x_offset = @intFromFloat(@round(x - max_x)),
                     .y_offset = ligature.y_offset,
-                    .glyph_index = tatweel,
+                    .glyph_index = fill.glyph,
                 });
             }
         }
+    }
+
+    const Tatweel = struct { glyph: u32, width: f64 };
+
+    /// The tatweel glyph of the run's font, or null if the font has none
+    /// or it is narrower than a pixel.
+    fn tatweelGlyph(run: font.shape.TextRun) !?Tatweel {
+        run.grid.lock.lockSharedUncancelable(global.io());
+        defer run.grid.lock.unlockShared(global.io());
+
+        const face = try run.grid.resolver.collection.getFace(run.font_index);
+        const glyph = face.glyphIndex(0x0640) orelse return null;
+        const width = face.font.getAdvancesForGlyphs(
+            .horizontal,
+            &.{@intCast(glyph)},
+            null,
+        );
+        if (width < 1) return null;
+        return .{ .glyph = glyph, .width = width };
     }
 
     /// Get an attr dict for a font from a specific index.
@@ -1044,7 +1067,7 @@ fn joinsRight(codepoints: []const Shaper.Codepoint, index: usize) bool {
         const cp = codepoints[i].codepoint;
         if (cp == 0) continue;
         return switch (joins(@intCast(cp))) {
-            .dual_joining, .join_causing => true,
+            .dual_joining, .left_joining, .join_causing => true,
             .transparent => continue,
             else => false,
         };
@@ -3000,6 +3023,55 @@ test "joinsRight checks the letter before a ligature" {
     try testing.expect(!joinsRight(&cps(&.{ 'ل', 'ا' }), 0));
     // A mark between the letters does not break the join: سَلا.
     try testing.expect(joinsRight(&cps(&.{ 'س', 0x064E, 'ل', 'ا' }), 2));
+}
+
+test "shape centers lam-alef and fills a joined side with tatweel" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+    const cell_width: i16 = @intCast(testdata.grid.metrics.cell_width);
+
+    const Case = struct { text: []const u8, ligature_x: u16, tatweels: usize };
+    for ([_]Case{
+        // Seen joins lam, so a tatweel fills the right side.
+        .{ .text = "سلام", .ligature_x = 2, .tatweels = 1 },
+        // Waw never joins the next letter, so the gap stays.
+        .{ .text = "دولار", .ligature_x = 2, .tatweels = 0 },
+    }) |case| {
+        var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+        defer t.deinit(alloc);
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(case.text);
+
+        var state: terminal.RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &t);
+
+        var it = testdata.shaper.runIterator(.{
+            .grid = testdata.grid,
+            .cells = state.row_data.get(0).cells.slice(),
+        });
+        const run = (try it.next(alloc)).?;
+        const face = try testdata.grid.resolver.collection.getFace(run.font_index);
+        const tatweel = face.glyphIndex(0x0640).?;
+
+        // The lam-alef glyph sits in the lam cell, moved half a cell left
+        // to the center of the lam and alef cells.
+        var tatweels: usize = 0;
+        var centered = false;
+        for (try testdata.shaper.shape(run)) |cell| {
+            if (cell.glyph_index == tatweel) {
+                tatweels += 1;
+            } else if (cell.x == case.ligature_x) {
+                centered = cell.x_offset == -@divTrunc(cell_width, 2);
+            }
+        }
+        try testing.expect(centered);
+        try testing.expectEqual(case.tatweels, tatweels);
+    }
 }
 
 test "shape hebrew RTL" {
