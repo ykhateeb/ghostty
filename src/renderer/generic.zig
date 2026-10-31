@@ -2833,8 +2833,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .grid = self.font_grid,
                         .cells = state.row_data.items(.cells)[cursor_vp.y].slice(),
                     });
-                    it.layout(self.alloc) catch break :cursor_x cursor_vp.x;
-                    break :cursor_x @intCast(it.visualColumn(cursor_vp.x));
+                    const row = it.layout(self.alloc) catch break :cursor_x cursor_vp.x;
+                    break :cursor_x @intCast(row.visualColumn(cursor_vp.x));
                 };
 
                 self.addCursor(
@@ -3005,8 +3005,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // We walk visual columns because the shaper places glyphs in
             // visual order. Each column reads its cell from its logical
             // column, which differs from the visual column in RTL text.
+            const row_layout = try run_iter.layout(self.alloc);
             for (0..cells_len) |x| {
-                const lx = run_iter.logicalColumn(x);
+                const lx = row_layout.logicalColumn(x);
                 const cell = &cells_raw[lx];
                 const managed_style = &cells_style[lx];
 

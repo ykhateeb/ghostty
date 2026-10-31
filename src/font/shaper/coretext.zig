@@ -2802,17 +2802,17 @@ test "run iterator column maps for RTL with a wide cell" {
         .grid = testdata.grid,
         .cells = state.row_data.get(0).cells.slice(),
     });
-    try it.layout(alloc);
+    const row = try it.layout(alloc);
 
     // The row is reversed, but the wide cell stays left of its spacer.
     const expected = [_]usize{ 5, 4, 2, 3, 1, 0 };
     for (expected, 0..) |l, x| {
-        try testing.expectEqual(l, it.logicalColumn(x));
-        try testing.expectEqual(x, it.visualColumn(l));
+        try testing.expectEqual(l, row.logicalColumn(x));
+        try testing.expectEqual(x, row.visualColumn(l));
     }
 
     // Empty cells after the text keep their column.
-    try testing.expectEqual(@as(usize, 8), it.logicalColumn(8));
+    try testing.expectEqual(@as(usize, 8), row.logicalColumn(8));
 }
 
 test "run iterator keeps an RTL word in one run across selection and cursor" {

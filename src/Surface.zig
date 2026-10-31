@@ -3996,7 +3996,8 @@ pub fn mouseButtonCallback(
         // gesture can conservatively treat the release as having moved away
         // from the pressed cell.
         const release_pin: ?terminal.Pin = if (release_pos) |pos| pin: {
-            const release_vp = self.posToViewport(pos.x, pos.y);
+            const sel_pos = self.selectionCursorPos(pos);
+            const release_vp = self.posToViewport(sel_pos.x, sel_pos.y);
             break :pin self.io.terminal.screens.active.pages.pin(.{ .viewport = .{
                 .x = release_vp.x,
                 .y = release_vp.y,
@@ -4101,7 +4102,7 @@ pub fn mouseButtonCallback(
         const t: *terminal.Terminal = self.renderer_state.terminal;
         const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
 
-        const pos = try self.rt_surface.getCursorPos();
+        const pos = self.selectionCursorPos(try self.rt_surface.getCursorPos());
         const pin = pin: {
             const pt_viewport = self.posToViewport(pos.x, pos.y);
             const pin = screen.pages.pin(.{
@@ -4820,10 +4821,12 @@ pub fn cursorPosCallback(
 
         // Convert to points
         const screen: *terminal.Screen = t.screens.active;
+        const sel_pos = self.selectionCursorPos(pos);
+        const sel_vp = self.posToViewport(sel_pos.x, sel_pos.y);
         const pin = screen.pages.pin(.{
             .viewport = .{
-                .x = pos_vp.x,
-                .y = pos_vp.y,
+                .x = sel_vp.x,
+                .y = sel_vp.y,
             },
         }) orelse {
             if (comptime std.debug.runtime_safety) unreachable;
@@ -4833,8 +4836,8 @@ pub fn cursorPosCallback(
         // Perform our drag behavior in our gesture handler.
         const drag_selection = self.mouse.selection_gesture.drag(t, .{
             .pin = pin,
-            .xpos = pos.x,
-            .ypos = pos.y,
+            .xpos = sel_pos.x,
+            .ypos = sel_pos.y,
             .rectangle = SurfaceMouse.isRectangleSelectState(self.mouse.mods),
             .word_boundary_codepoints = self.config.selection_word_chars,
             .geometry = .{
@@ -4894,6 +4897,43 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
     const coord: rendererpkg.Coordinate = .{ .surface = .{ .x = xpos, .y = ypos } };
     const grid = coord.convert(.grid, self.size).grid;
     return .{ .x = grid.x, .y = grid.y };
+}
+
+/// The renderer draws RTL text at visual columns, but selections use
+/// logical columns. Map a mouse position on RTL text to the logical cell
+/// under it, and mirror the offset in that cell, so the selection gesture
+/// works unchanged.
+///
+/// Precondition: the render_state mutex must be held.
+fn selectionCursorPos(self: *Surface, pos: apprt.CursorPos) apprt.CursorPos {
+    const vp = self.posToViewport(pos.x, pos.y);
+    const pin = self.renderer_state.terminal.screens.active.pages.pin(
+        .{ .viewport = vp },
+    ) orelse return pos;
+
+    var scratch: font.shape.RowLayout.Scratch = .{};
+    defer scratch.deinit(self.alloc);
+    const row = font.shape.RowLayout.init(
+        self.alloc,
+        &scratch,
+        pin.cells(.all),
+    ) catch return pos;
+    if (row.cells.len == 0) return pos;
+
+    // Right of the text, a row that ends in RTL text continues from the
+    // right edge of its last cell, which is where that text starts.
+    const last = row.cells.len - 1;
+    const past_end = vp.x > last and row.runAt(last).?.is_rtl;
+    const x = if (past_end) last else vp.x;
+    const run = row.runAt(x) orelse return pos;
+
+    const cell_width: f32 = @floatFromInt(self.size.cell.width);
+    const padding: f32 = @floatFromInt(self.size.padding.left);
+    const visual_x: f32 = @floatFromInt(x);
+    const logical_x: f32 = @floatFromInt(row.logicalColumn(x));
+    const offset = if (past_end) cell_width - 1 else pos.x - padding - visual_x * cell_width;
+    const mapped_offset = if (run.is_rtl) @max(0, cell_width - 1 - offset) else offset;
+    return .{ .x = padding + logical_x * cell_width + mapped_offset, .y = pos.y };
 }
 
 /// Scroll to the bottom of the viewport.
