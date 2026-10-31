@@ -433,6 +433,10 @@ pub const Shaper = struct {
         // we set this to true, which indicates that we must sort our buffer.
         var non_ltr: bool = false;
 
+        // The source of each output glyph, which RTL runs need to place
+        // ligatures that cover more than one cell.
+        var sources: std.ArrayList(GlyphSource) = .empty;
+
         // CoreText may generate multiple runs even though our input to
         // CoreText is already split into runs by our own run iterator.
         // The runs as far as I can tell are always sequential to each
@@ -617,6 +621,10 @@ pub const Shaper = struct {
                     .y_offset = @intFromFloat(@round(position.y)),
                     .glyph_index = glyph,
                 });
+                if (run.rtl) try sources.append(alloc, .{
+                    .index = index,
+                    .advance = advance.width,
+                });
 
                 // Add our advances to keep track of our run offsets.
                 // Advances apply to the NEXT cell.
@@ -627,6 +635,8 @@ pub const Shaper = struct {
                 //run_offset_y += advance.height;
             }
         }
+
+        if (run.rtl) try self.spreadLigatures(run, sources.items);
 
         // CoreText may return RTL or otherwise non-monotonic glyph runs. The
         // renderer expects cells sorted by increasing terminal x, so normalize
@@ -646,6 +656,78 @@ pub const Shaper = struct {
         }
 
         return self.cell_buf.items;
+    }
+
+    const GlyphSource = struct {
+        /// The index in the shaped string of the glyph's first codepoint.
+        index: usize,
+        advance: f64,
+    };
+
+    /// A ligature such as lam-alef covers two or more cells, but its
+    /// glyph is narrower, so it leaves an empty cell. Center each ligature
+    /// on its cells. If the letter on its right joins to it, fill the gap
+    /// on that side with tatweel glyphs, so the word stays connected.
+    fn spreadLigatures(
+        self: *Shaper,
+        run: font.shape.TextRun,
+        sources: []const GlyphSource,
+    ) !void {
+        const codepoints = self.run_state.codepoints.items;
+        const cell_width: f64 = @floatFromInt(run.grid.metrics.cell_width);
+        for (sources, 0..) |source, g| {
+            const first = codepoints[source.index];
+            if (first.codepoint == 0 or isMark(first.codepoint)) continue;
+
+            // The glyph covers its codepoints up to the next base glyph.
+            var end = codepoints.len;
+            for (sources) |other| {
+                if (other.index > source.index and
+                    !isMark(codepoints[other.index].codepoint)) end = @min(end, other.index);
+            }
+            var min = first.cluster;
+            var max = first.cluster;
+            for (codepoints[source.index..end]) |cp| {
+                if (cp.codepoint == 0) continue;
+                min = @min(min, cp.cluster);
+                max = @max(max, cp.cluster);
+            }
+            if (min == max) continue;
+
+            // Move the glyph, and the marks drawn on its cells, to the center.
+            const span: f64 = @floatFromInt(max - min + 1);
+            const left = @as(f64, @floatFromInt(min)) * cell_width +
+                (span * cell_width - source.advance) / 2;
+            const ligature = self.cell_buf.items[g];
+            const now = @as(f64, @floatFromInt(ligature.x)) * cell_width +
+                @as(f64, @floatFromInt(ligature.x_offset));
+            const delta: i16 = @intFromFloat(@round(left - now));
+            for (self.cell_buf.items[0..sources.len]) |*cell| {
+                if (cell.x >= min and cell.x <= max) cell.x_offset += delta;
+            }
+
+            if (!joinsRight(codepoints, source.index)) continue;
+            const face = try run.grid.resolver.collection.getFace(run.font_index);
+            const tatweel = face.glyphIndex(0x0640) orelse continue;
+            const width = face.font.getAdvancesForGlyphs(
+                .horizontal,
+                &.{@intCast(tatweel)},
+                null,
+            );
+            if (width <= 0) continue;
+
+            // Fill from the right edge of the cells back to the glyph.
+            const max_x = @as(f64, @floatFromInt(max)) * cell_width;
+            var x = max_x + cell_width - width;
+            while (x + width > left + source.advance) : (x -= width) {
+                try self.cell_buf.append(self.alloc, .{
+                    .x = @intCast(max),
+                    .x_offset = @intFromFloat(@round(x - max_x)),
+                    .y_offset = ligature.y_offset,
+                    .glyph_index = tatweel,
+                });
+            }
+        }
     }
 
     /// Get an attr dict for a font from a specific index.
@@ -943,6 +1025,32 @@ pub const Shaper = struct {
         }
     }
 };
+
+fn isMark(cp: u32) bool {
+    return unicode.table.get(@intCast(cp)).width_zero_in_grapheme;
+}
+
+/// True if the codepoint at `index` joins the letter before it in logical
+/// order, which is the letter on its right in RTL text.
+fn joinsRight(codepoints: []const Shaper.Codepoint, index: usize) bool {
+    const joins = itijah.unicode.joiningType;
+    switch (joins(@intCast(codepoints[index].codepoint))) {
+        .dual_joining, .right_joining, .join_causing => {},
+        else => return false,
+    }
+    var i = index;
+    while (i > 0) {
+        i -= 1;
+        const cp = codepoints[i].codepoint;
+        if (cp == 0) continue;
+        return switch (joins(@intCast(cp))) {
+            .dual_joining, .join_causing => true,
+            .transparent => continue,
+            else => false,
+        };
+    }
+    return false;
+}
 
 test "run iterator" {
     const testing = std.testing;
@@ -2872,6 +2980,26 @@ test "run iterator splits an RTL run at an invisible cell" {
     var cells: u16 = 0;
     while (try it.next(alloc)) |run| cells += run.cells;
     try testing.expectEqual(@as(u16, 4), cells);
+}
+
+test "joinsRight checks the letter before a ligature" {
+    const testing = std.testing;
+    const cps = struct {
+        fn of(comptime s: []const u21) [s.len]Shaper.Codepoint {
+            var out: [s.len]Shaper.Codepoint = undefined;
+            for (s, &out) |cp, *o| o.* = .{ .codepoint = cp, .cluster = 0 };
+            return out;
+        }
+    }.of;
+
+    // سلام: seen joins lam.
+    try testing.expect(joinsRight(&cps(&.{ 'س', 'ل', 'ا', 'م' }), 1));
+    // دولار: waw never joins the next letter.
+    try testing.expect(!joinsRight(&cps(&.{ 'د', 'و', 'ل', 'ا', 'ر' }), 2));
+    // لا at the start of a word has nothing to join.
+    try testing.expect(!joinsRight(&cps(&.{ 'ل', 'ا' }), 0));
+    // A mark between the letters does not break the join: سَلا.
+    try testing.expect(joinsRight(&cps(&.{ 'س', 0x064E, 'ل', 'ا' }), 2));
 }
 
 test "shape hebrew RTL" {
