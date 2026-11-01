@@ -1,8 +1,8 @@
 name: Release Fork
 
-# Build Ghostty.app from main and publish it as the newest release. The
-# nix-darwin flake in the dotfiles repo installs it from
-# releases/latest/download/Ghostty.dmg.
+# Build Ghostty.app from main, publish it as the newest release, and write
+# its URL and hash to ghostty.json on the release-info branch. The
+# nix-darwin flake in the dotfiles repo installs the app from that file.
 on:
   push:
     branches: [main]
@@ -51,3 +51,23 @@ jobs:
           gh release create "$tag" Ghostty.dmg \
             --target "$GITHUB_SHA" --latest --title "$tag" \
             --notes "Ghostty.app built from $GITHUB_SHA."
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
+      # The flake reads ghostty.json from the release-info branch. The tag
+      # URL and the hash never change, so the flake lock stays valid.
+      - name: Update release-info
+        run: |
+          if git fetch -q --depth=1 origin release-info; then
+            git worktree add info FETCH_HEAD
+          else
+            git worktree add --orphan -b release-info info
+          fi
+          hash="sha256-$(openssl dgst -sha256 -binary Ghostty.dmg | base64)"
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/Ghostty.dmg"
+          printf '{\n  "url": "%s",\n  "hash": "%s"\n}\n' "$url" "$hash" > info/ghostty.json
+          cd info
+          git add ghostty.json
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Release $TAG"
+          git push -q origin HEAD:release-info
