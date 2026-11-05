@@ -54,6 +54,8 @@ jobs:
           security create-keychain -p "$kc_pwd" "$kc"
           security set-keychain-settings "$kc"
           security unlock-keychain -p "$kc_pwd" "$kc"
+          # codesign finds the identity only in a keychain on the search list.
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
           security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$CERTIFICATE_PWD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pwd" "$kc" > /dev/null
           rm "$RUNNER_TEMP/cert.p12"
