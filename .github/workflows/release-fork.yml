@@ -38,6 +38,45 @@ jobs:
           mkdir -p zig-out/share/locale
           zig build -Doptimize=ReleaseFast -Di18n=false
 
+      # The build signs the app ad-hoc, so macOS forgets its Screen Recording
+      # and Accessibility permissions after each new release. A signature
+      # from one fixed certificate keeps the permissions. The certificate is
+      # self-signed: it has no Team ID, so the app keeps its entitlements
+      # (disable-library-validation lets it load Sparkle).
+      - name: Sign Ghostty.app
+        env:
+          CERTIFICATE: ${{ secrets.FORK_SIGNING_CERTIFICATE }}
+          CERTIFICATE_PWD: ${{ secrets.FORK_SIGNING_CERTIFICATE_PWD }}
+        run: |
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          kc_pwd="$(openssl rand -hex 16)"
+          echo "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kc_pwd" "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p "$kc_pwd" "$kc"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pwd" "$kc" > /dev/null
+          rm "$RUNNER_TEMP/cert.p12"
+          id="$(security find-identity -p codesigning "$kc" | awk '$1 == "1)" { print $2; exit }')"
+
+          app=macos/build/ReleaseLocal/Ghostty.app
+          sparkle="$app/Contents/Frameworks/Sparkle.framework"
+          # Sign the inner parts first and the app last.
+          for path in \
+            "$sparkle/Versions/B/XPCServices/Downloader.xpc" \
+            "$sparkle/Versions/B/XPCServices/Installer.xpc" \
+            "$sparkle/Versions/B/Autoupdate" \
+            "$sparkle/Versions/B/Updater.app" \
+            "$sparkle" \
+            "$app/Contents/PlugIns/DockTilePlugin.plugin" \
+            "$app"; do
+            codesign --force --keychain "$kc" --sign "$id" \
+              --options runtime --preserve-metadata=entitlements "$path"
+          done
+          codesign --verify --deep --strict "$app"
+          codesign -d -r- "$app"
+          security delete-keychain "$kc"
+
       - name: Make the DMG
         run: |
           hdiutil create -volname Ghostty -fs HFS+ -format UDZO \
