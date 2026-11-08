@@ -1279,6 +1279,38 @@ test "shape digits between RTL split into LTR run" {
     try testing.expectEqual(try it.next(alloc), null);
 }
 
+test "run iterator keeps RTL runs inside box-drawing fields" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .julia_mono);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("אבג  │ דהו");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var it = testdata.shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    const row = try it.layout(alloc);
+
+    // Each field reverses in place, and the separator keeps its column.
+    const expected = [_]usize{ 2, 1, 0, 3, 4, 5, 6, 9, 8, 7 };
+    for (expected, 0..) |l, x| {
+        try testing.expectEqual(l, row.logicalColumn(x));
+        try testing.expectEqual(x, row.visualColumn(l));
+    }
+}
+
 test "shape emoji width" {
     const testing = std.testing;
     const alloc = testing.allocator;
