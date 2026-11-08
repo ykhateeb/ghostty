@@ -545,7 +545,13 @@ pub const RunIterator = struct {
 
 fn bidiCodepoint(cell: terminal.page.Cell) u21 {
     const cp = cell.codepoint();
-    return @intCast(if (cp == 0) ' ' else cp);
+    return switch (cp) {
+        0 => ' ',
+        // Box drawing separates TUI columns. Report it as LTR so an RTL run can't
+        // cross one; any LTR letter works.
+        0x2500...0x257F => 'x',
+        else => @intCast(cp),
+    };
 }
 
 fn fontStyleForStyle(style: terminal.Style) font.Style {
